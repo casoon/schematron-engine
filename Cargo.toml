@@ -1,0 +1,19 @@
+[package]
+name = "schematron-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A pure-Rust ISO Schematron rule engine, generic over the document model"
+readme = "README.md"
+keywords = ["schematron", "xml", "validation", "xpath"]
+categories = ["parser-implementations"]
+license = "MIT"
+repository = "https://github.com/casoon/schematron-engine"
+
+[dependencies]
+roxmltree = "0.21.1"
+xpath-eval = "0.2.1"
+
+[[bench]]
+name = "evaluate"
+harness = false
