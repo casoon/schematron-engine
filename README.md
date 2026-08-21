@@ -26,13 +26,6 @@ Two-stage goal, deliberately in that order:
    a `priority` attribute; checked against the ISO grammar, `rule` has no
    such attribute, so that behavior already is stage 2's final semantics.)
 
-The name `schematron-engine` reflects stage 2 as the standing goal, not
-just stage 1's initial scope — a full ISO Schematron implementation is
-genuine rule-execution logic on top of XPath (phase/variable handling,
-pattern templating, rule composition — not just "call `xpath-eval` in a
-loop"), which is what justifies "engine" over a narrower name like
-`schematron-conform` or `schematron-run`.
-
 ## Status
 
 Both stages are complete: schema parsing, evaluation against a document,
