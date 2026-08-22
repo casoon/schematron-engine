@@ -15,16 +15,13 @@ use crate::schema::{
 const SCHEMATRON_NAMESPACE: &str = "http://purl.oclc.org/dsdl/schematron";
 
 // Direct-child allowlists per container, verified against the ISO
-// Schematron RNC grammar (`github.com/Schematron/schema`, see
-// `plan/04-let-bindings.md`, `plan/05-phase-selection.md`,
-// `plan/08-diagnostics.md` for the fragments this was checked against).
-// `title`/`p` are real ISO elements (prose/documentation) accepted
-// wherever the grammar allows them, even though this crate never reads
-// their content — everything else not listed here is either a typo of a
-// known element or a genuinely unimplemented ISO construct (e.g.
-// `<include>`), both surfaced as `ParseError::UnexpectedElement` rather
-// than silently dropped. Foreign-namespace elements are untouched by this
-// list entirely (see `validate_known_children`).
+// Schematron RNC grammar (`github.com/Schematron/schema`; source
+// fragments: `plan/04-let-bindings.md`, `plan/05-phase-selection.md`,
+// `plan/08-diagnostics.md`). `title`/`p` are real ISO prose/documentation
+// elements, accepted but unread. Anything else not listed is either a
+// typo or an unimplemented ISO construct (e.g. `<include>`) — both become
+// `ParseError::UnexpectedElement` (see `validate_known_children`), not a
+// silent drop. Foreign-namespace elements are unaffected by this list.
 const SCHEMA_ALLOWED_CHILDREN: &[&str] =
     &["title", "p", "ns", "let", "phase", "pattern", "diagnostics"];
 const PATTERN_ALLOWED_CHILDREN: &[&str] = &["title", "p", "let", "rule"];
@@ -179,11 +176,7 @@ pub fn parse(xml: &str) -> Result<Schema, ParseError> {
 
     validate_known_children(root, SCHEMA_ALLOWED_CHILDREN)?;
 
-    let ns = root
-        .children()
-        .filter(|node| node.has_tag_name((SCHEMATRON_NAMESPACE, "ns")))
-        .map(parse_ns)
-        .collect::<Result<_, _>>()?;
+    let ns = collect_children(root, "ns", parse_ns)?;
 
     let lets = collect_lets(root)?;
 
@@ -252,11 +245,7 @@ pub fn parse(xml: &str) -> Result<Schema, ParseError> {
                         position: position_of(node),
                     }
                 })?;
-                let params = node
-                    .children()
-                    .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "param")))
-                    .map(parse_param)
-                    .collect::<Result<Vec<_>, _>>()?;
+                let params = collect_children(node, "param", parse_param)?;
                 parse_pattern(abstract_node, id, &params, &diagnostic_ids)
             } else {
                 parse_pattern(node, id, &[], &diagnostic_ids)
@@ -268,11 +257,7 @@ pub fn parse(xml: &str) -> Result<Schema, ParseError> {
         return Err(ParseError::NoPatterns);
     }
 
-    let phases = root
-        .children()
-        .filter(|node| node.has_tag_name((SCHEMATRON_NAMESPACE, "phase")))
-        .map(|node| parse_phase(node, &pattern_ids))
-        .collect::<Result<_, _>>()?;
+    let phases = collect_children(root, "phase", |node| parse_phase(node, &pattern_ids))?;
 
     Ok(Schema {
         ns,
@@ -313,10 +298,21 @@ fn parse_diagnostics_element(node: Node<'_, '_>) -> Result<Vec<Diagnostic>, Pars
 /// abstract-pattern instantiation).
 fn parse_diagnostic(node: Node<'_, '_>) -> Result<Diagnostic, ParseError> {
     let id = required_attribute(node, "diagnostic", "id")?.to_owned();
+    let (role, message) = parse_role_and_message(node, &[])?;
+    Ok(Diagnostic { id, role, message })
+}
+
+/// Reads the optional `role="..."` attribute and the rich-content message
+/// body — shared by [`parse_diagnostic`] and [`parse_check`], the two
+/// element kinds with that exact `role`/message-content shape.
+fn parse_role_and_message(
+    node: Node<'_, '_>,
+    params: &[(String, String)],
+) -> Result<(Option<String>, Vec<MessagePart>), ParseError> {
     let role = node.attribute("role").map(str::to_owned);
     let mut message = Vec::new();
-    collect_message_parts(node, &mut message, &[])?;
-    Ok(Diagnostic { id, role, message })
+    collect_message_parts(node, &mut message, params)?;
+    Ok((role, message))
 }
 
 /// Parses an `<ns prefix="..." uri="...">` binding. Both attributes are
@@ -350,11 +346,7 @@ fn parse_phase(node: Node<'_, '_>, pattern_ids: &HashSet<String>) -> Result<Phas
     validate_known_children(node, PHASE_ALLOWED_CHILDREN)?;
     let id = required_attribute(node, "phase", "id")?.to_owned();
     let lets = collect_lets(node)?;
-    let active = node
-        .children()
-        .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "active")))
-        .map(|child| parse_active(child, pattern_ids))
-        .collect::<Result<_, _>>()?;
+    let active = collect_children(node, "active", |child| parse_active(child, pattern_ids))?;
     Ok(Phase { id, lets, active })
 }
 
@@ -532,9 +524,7 @@ fn parse_check(
     };
     let test = substitute(required_attribute(node, element, "test")?, params);
     let id = node.attribute("id").map(str::to_owned);
-    let role = node.attribute("role").map(str::to_owned);
-    let mut message = Vec::new();
-    collect_message_parts(node, &mut message, params)?;
+    let (role, message) = parse_role_and_message(node, params)?;
     let diagnostics: Vec<String> = node
         .attribute("diagnostics")
         .map(|ids| ids.split_whitespace().map(str::to_owned).collect())
@@ -609,9 +599,20 @@ fn required_attribute<'a>(
 /// `let*` grammar position (schema/pattern/rule/phase level) goes
 /// through.
 fn collect_lets(node: Node<'_, '_>) -> Result<Vec<LetBinding>, ParseError> {
+    collect_children(node, "let", parse_let)
+}
+
+/// Parses every direct `tag`-named child (Schematron namespace) of `node`
+/// via `f` — the one place every "filter by tag, parse each, collect"
+/// grammar position (`let*`, `param*`, `active*`, ...) goes through.
+fn collect_children<T>(
+    node: Node<'_, '_>,
+    tag: &str,
+    f: impl FnMut(Node<'_, '_>) -> Result<T, ParseError>,
+) -> Result<Vec<T>, ParseError> {
     node.children()
-        .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "let")))
-        .map(parse_let)
+        .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, tag)))
+        .map(f)
         .collect()
 }
 
