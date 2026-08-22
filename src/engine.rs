@@ -220,6 +220,32 @@ pub fn evaluate_with_phase<'a, D: Document>(
     Ok(reports)
 }
 
+/// Parses and evaluates the raw XPath expression `raw` against `node`,
+/// with `ns_lookup`/`vars` wired up as the namespace/variable hooks — the
+/// one place every `context`/`test`/`value-of/@select` expression
+/// evaluation goes through (a `<let>` binding's `value`, a check's
+/// `test`, and a message's `<value-of>` all share this exact shape:
+/// parse, build an unprefixed-name variable lookup over `vars`, evaluate).
+fn evaluate_xpath<'n, N: Node<'n>>(
+    raw: &str,
+    node: N,
+    ns_lookup: &dyn Fn(&str) -> Option<String>,
+    vars: &HashMap<String, Value<N>>,
+) -> Result<Value<N>, SchematronEvalError> {
+    let expr = xpath_eval::parse(raw).map_err(SchematronEvalError::Parse)?;
+    let lookup = |name: &QName| {
+        if name.prefix.is_some() {
+            None
+        } else {
+            vars.get(&name.local).cloned()
+        }
+    };
+    let mut ctx = EvaluationContext::new(node);
+    ctx.namespaces = Some(ns_lookup);
+    ctx.variables = Some(&lookup);
+    xpath_eval::evaluate(&expr, &ctx).map_err(SchematronEvalError::Eval)
+}
+
 /// Evaluates `lets` in document order against `context_node`, inserting
 /// each binding's value into `vars` as it goes — so a binding's `value`
 /// expression can reference earlier bindings already in `vars` (both from
@@ -234,20 +260,7 @@ fn extend_lets<'n, N: Node<'n>>(
     ns_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(), SchematronEvalError> {
     for binding in lets {
-        let expr = xpath_eval::parse(&binding.value).map_err(SchematronEvalError::Parse)?;
-        let value = {
-            let lookup = |name: &QName| {
-                if name.prefix.is_some() {
-                    None
-                } else {
-                    vars.get(&name.local).cloned()
-                }
-            };
-            let mut ctx = EvaluationContext::new(context_node);
-            ctx.namespaces = Some(ns_lookup);
-            ctx.variables = Some(&lookup);
-            xpath_eval::evaluate(&expr, &ctx).map_err(SchematronEvalError::Eval)?
-        };
+        let value = evaluate_xpath(&binding.value, context_node, ns_lookup, vars)?;
         vars.insert(binding.name.clone(), value);
     }
     Ok(())
@@ -264,18 +277,7 @@ fn evaluate_check<'n, N: Node<'n>>(
     vars: &HashMap<String, Value<N>>,
     diagnostics: &[Diagnostic],
 ) -> Result<Option<Report<N>>, SchematronEvalError> {
-    let expr = xpath_eval::parse(&check.test).map_err(SchematronEvalError::Parse)?;
-    let lookup = |name: &QName| {
-        if name.prefix.is_some() {
-            None
-        } else {
-            vars.get(&name.local).cloned()
-        }
-    };
-    let mut ctx = EvaluationContext::new(node);
-    ctx.namespaces = Some(ns_lookup);
-    ctx.variables = Some(&lookup);
-    let value = xpath_eval::evaluate(&expr, &ctx).map_err(SchematronEvalError::Eval)?;
+    let value = evaluate_xpath(&check.test, node, ns_lookup, vars)?;
     let boolean = value.to_boolean();
 
     let fires = match check.kind {
@@ -327,18 +329,7 @@ fn render_message<'n, N: Node<'n>>(
         match part {
             MessagePart::Text(text) => message.push_str(text),
             MessagePart::ValueOf(select) => {
-                let expr = xpath_eval::parse(select).map_err(SchematronEvalError::Parse)?;
-                let lookup = |name: &QName| {
-                    if name.prefix.is_some() {
-                        None
-                    } else {
-                        vars.get(&name.local).cloned()
-                    }
-                };
-                let mut ctx = EvaluationContext::new(node);
-                ctx.namespaces = Some(ns_lookup);
-                ctx.variables = Some(&lookup);
-                let value = xpath_eval::evaluate(&expr, &ctx).map_err(SchematronEvalError::Eval)?;
+                let value = evaluate_xpath(select, node, ns_lookup, vars)?;
                 message.push_str(&value.to_xpath_string());
             }
         }

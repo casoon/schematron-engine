@@ -185,11 +185,7 @@ pub fn parse(xml: &str) -> Result<Schema, ParseError> {
         .map(parse_ns)
         .collect::<Result<_, _>>()?;
 
-    let lets = root
-        .children()
-        .filter(|node| node.has_tag_name((SCHEMATRON_NAMESPACE, "let")))
-        .map(parse_let)
-        .collect::<Result<_, _>>()?;
+    let lets = collect_lets(root)?;
 
     let default_phase = root.attribute("defaultPhase").map(str::to_owned);
 
@@ -316,14 +312,7 @@ fn parse_diagnostics_element(node: Node<'_, '_>) -> Result<Vec<Diagnostic>, Pars
 /// parameter substitution (diagnostics are schema-level, never part of an
 /// abstract-pattern instantiation).
 fn parse_diagnostic(node: Node<'_, '_>) -> Result<Diagnostic, ParseError> {
-    let id = node
-        .attribute("id")
-        .ok_or_else(|| ParseError::MissingAttribute {
-            element: "diagnostic",
-            attribute: "id",
-            position: position_of(node),
-        })?
-        .to_owned();
+    let id = required_attribute(node, "diagnostic", "id")?.to_owned();
     let role = node.attribute("role").map(str::to_owned);
     let mut message = Vec::new();
     collect_message_parts(node, &mut message, &[])?;
@@ -335,22 +324,8 @@ fn parse_diagnostic(node: Node<'_, '_>) -> Result<Diagnostic, ParseError> {
 /// error, not a silent empty-string fallback (an empty prefix/uri binding
 /// is never meaningful).
 fn parse_ns(node: Node<'_, '_>) -> Result<NamespaceBinding, ParseError> {
-    let prefix = node
-        .attribute("prefix")
-        .ok_or_else(|| ParseError::MissingAttribute {
-            element: "ns",
-            attribute: "prefix",
-            position: position_of(node),
-        })?
-        .to_owned();
-    let uri = node
-        .attribute("uri")
-        .ok_or_else(|| ParseError::MissingAttribute {
-            element: "ns",
-            attribute: "uri",
-            position: position_of(node),
-        })?
-        .to_owned();
+    let prefix = required_attribute(node, "ns", "prefix")?.to_owned();
+    let uri = required_attribute(node, "ns", "uri")?.to_owned();
     Ok(NamespaceBinding { prefix, uri })
 }
 
@@ -360,22 +335,8 @@ fn parse_ns(node: Node<'_, '_>) -> Result<NamespaceBinding, ParseError> {
 /// is out of scope, and a `<let>` without `value` is a regular
 /// `MissingAttribute` error, not a silent fallback.
 fn parse_let(node: Node<'_, '_>) -> Result<LetBinding, ParseError> {
-    let name = node
-        .attribute("name")
-        .ok_or_else(|| ParseError::MissingAttribute {
-            element: "let",
-            attribute: "name",
-            position: position_of(node),
-        })?
-        .to_owned();
-    let value = node
-        .attribute("value")
-        .ok_or_else(|| ParseError::MissingAttribute {
-            element: "let",
-            attribute: "value",
-            position: position_of(node),
-        })?
-        .to_owned();
+    let name = required_attribute(node, "let", "name")?.to_owned();
+    let value = required_attribute(node, "let", "value")?.to_owned();
     Ok(LetBinding { name, value })
 }
 
@@ -387,19 +348,8 @@ fn parse_let(node: Node<'_, '_>) -> Result<LetBinding, ParseError> {
 /// `DECISIONS.md`).
 fn parse_phase(node: Node<'_, '_>, pattern_ids: &HashSet<String>) -> Result<Phase, ParseError> {
     validate_known_children(node, PHASE_ALLOWED_CHILDREN)?;
-    let id = node
-        .attribute("id")
-        .ok_or_else(|| ParseError::MissingAttribute {
-            element: "phase",
-            attribute: "id",
-            position: position_of(node),
-        })?
-        .to_owned();
-    let lets = node
-        .children()
-        .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "let")))
-        .map(parse_let)
-        .collect::<Result<_, _>>()?;
+    let id = required_attribute(node, "phase", "id")?.to_owned();
+    let lets = collect_lets(node)?;
     let active = node
         .children()
         .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "active")))
@@ -409,13 +359,7 @@ fn parse_phase(node: Node<'_, '_>, pattern_ids: &HashSet<String>) -> Result<Phas
 }
 
 fn parse_active(node: Node<'_, '_>, pattern_ids: &HashSet<String>) -> Result<String, ParseError> {
-    let pattern = node
-        .attribute("pattern")
-        .ok_or_else(|| ParseError::MissingAttribute {
-            element: "active",
-            attribute: "pattern",
-            position: position_of(node),
-        })?;
+    let pattern = required_attribute(node, "active", "pattern")?;
     if !pattern_ids.contains(pattern) {
         return Err(ParseError::UnknownActivePattern {
             pattern: pattern.to_owned(),
@@ -428,22 +372,8 @@ fn parse_active(node: Node<'_, '_>, pattern_ids: &HashSet<String>) -> Result<Str
 /// Parses a `<param name="..." value="...">` child of an `is-a` pattern
 /// use, as a raw `(name, value)` pair for [`substitute`].
 fn parse_param(node: Node<'_, '_>) -> Result<(String, String), ParseError> {
-    let name = node
-        .attribute("name")
-        .ok_or_else(|| ParseError::MissingAttribute {
-            element: "param",
-            attribute: "name",
-            position: position_of(node),
-        })?
-        .to_owned();
-    let value = node
-        .attribute("value")
-        .ok_or_else(|| ParseError::MissingAttribute {
-            element: "param",
-            attribute: "value",
-            position: position_of(node),
-        })?
-        .to_owned();
+    let name = required_attribute(node, "param", "name")?.to_owned();
+    let value = required_attribute(node, "param", "value")?.to_owned();
     Ok((name, value))
 }
 
@@ -474,11 +404,7 @@ fn parse_pattern(
 ) -> Result<Pattern, ParseError> {
     validate_known_children(node, PATTERN_ALLOWED_CHILDREN)?;
 
-    let lets = node
-        .children()
-        .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "let")))
-        .map(parse_let)
-        .collect::<Result<_, _>>()?;
+    let lets = collect_lets(node)?;
 
     let rule_index: HashMap<String, Node<'_, '_>> = node
         .children()
@@ -509,21 +435,9 @@ fn parse_rule(
 ) -> Result<Rule, ParseError> {
     validate_known_children(node, RULE_ALLOWED_CHILDREN)?;
 
-    let context = substitute(
-        node.attribute("context")
-            .ok_or_else(|| ParseError::MissingAttribute {
-                element: "rule",
-                attribute: "context",
-                position: position_of(node),
-            })?,
-        params,
-    );
+    let context = substitute(required_attribute(node, "rule", "context")?, params);
 
-    let lets = node
-        .children()
-        .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "let")))
-        .map(parse_let)
-        .collect::<Result<_, _>>()?;
+    let lets = collect_lets(node)?;
 
     // Cycle guard for <extends>, seeded with this rule's own id so a
     // direct self-extends is caught the same way as a transitive one.
@@ -616,15 +530,7 @@ fn parse_check(
         CheckKind::Assert => "assert",
         CheckKind::Report => "report",
     };
-    let test = substitute(
-        node.attribute("test")
-            .ok_or_else(|| ParseError::MissingAttribute {
-                element,
-                attribute: "test",
-                position: position_of(node),
-            })?,
-        params,
-    );
+    let test = substitute(required_attribute(node, element, "test")?, params);
     let id = node.attribute("id").map(str::to_owned);
     let role = node.attribute("role").map(str::to_owned);
     let mut message = Vec::new();
@@ -674,19 +580,39 @@ fn collect_message_parts(
                 parts.push(MessagePart::Text(text.to_owned()));
             }
         } else if child.has_tag_name((SCHEMATRON_NAMESPACE, "value-of")) {
-            let select = child
-                .attribute("select")
-                .ok_or_else(|| ParseError::MissingAttribute {
-                    element: "value-of",
-                    attribute: "select",
-                    position: position_of(child),
-                })?;
+            let select = required_attribute(child, "value-of", "select")?;
             parts.push(MessagePart::ValueOf(substitute(select, params)));
         } else if child.is_element() {
             collect_message_parts(child, parts, params)?;
         }
     }
     Ok(())
+}
+
+/// Reads a required attribute, or [`ParseError::MissingAttribute`] at
+/// `node`'s position — the one place every `element/@attribute` required-
+/// attribute read goes through.
+fn required_attribute<'a>(
+    node: Node<'a, '_>,
+    element: &'static str,
+    attribute: &'static str,
+) -> Result<&'a str, ParseError> {
+    node.attribute(attribute)
+        .ok_or_else(|| ParseError::MissingAttribute {
+            element,
+            attribute,
+            position: position_of(node),
+        })
+}
+
+/// Collects an element's direct `<let>` children — the one place every
+/// `let*` grammar position (schema/pattern/rule/phase level) goes
+/// through.
+fn collect_lets(node: Node<'_, '_>) -> Result<Vec<LetBinding>, ParseError> {
+    node.children()
+        .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "let")))
+        .map(parse_let)
+        .collect()
 }
 
 /// Errors on any direct child element of `node` that is in the Schematron
