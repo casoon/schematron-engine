@@ -17,7 +17,14 @@
 //! - `rule context="X"` is evaluated as the path
 //!   `descendant-or-self::node()/X` from the document root — the usual
 //!   pragmatic reduction of an XSLT-style match pattern to a regular
-//!   location path.
+//!   location path. When `X` is itself a `|`-union of several alternatives
+//!   (e.g. `context="a | b"`), each top-level alternative gets its own
+//!   `descendant-or-self::node()/` prefix (via [`split_top_level_union`])
+//!   rather than prefixing the whole string once: XPath's `/` binds
+//!   tighter than `|`, so a single shared prefix would only apply to the
+//!   first alternative — every later one would be evaluated as a bare
+//!   relative path from the document root instead of "anywhere in the
+//!   document", matching only a direct root child of that name.
 //! - `assert test="X"` fires (produces a `Report`) when `X` evaluates to
 //!   `false`; `report test="X"` fires when `X` evaluates to `true`.
 //! - `<let name="..." value="...">` (Stage 2, `plan/04-let-bindings.md`)
@@ -100,6 +107,40 @@ impl std::fmt::Display for SchematronEvalError {
 
 impl std::error::Error for SchematronEvalError {}
 
+/// Splits a `context` (or any XPath `UnionExpr`) string on its top-level
+/// `|` operators, i.e. the ones that are not nested inside `[...]`
+/// predicates, `(...)` groups, or `'...'`/`"..."` string literals. A
+/// context with no top-level `|` is returned as a single-element vec
+/// (unchanged, whitespace and all) — the common case.
+fn split_top_level_union(context: &str) -> Vec<&str> {
+    let mut alternatives = Vec::new();
+    let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
+    let mut start = 0;
+
+    for (byte_offset, ch) in context.char_indices() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                '|' if depth == 0 => {
+                    alternatives.push(&context[start..byte_offset]);
+                    start = byte_offset + ch.len_utf8();
+                }
+                _ => {}
+            },
+        }
+    }
+    alternatives.push(&context[start..]);
+    alternatives
+}
+
 /// Evaluates `schema` against `document` under ISO's `#DEFAULT` phase
 /// resolution: `schema.default_phase` if set, otherwise `#ALL` (every
 /// pattern) — see [`evaluate_with_phase`] and `plan/05-phase-selection.md`.
@@ -175,7 +216,11 @@ pub fn evaluate_with_phase<'a, D: Document>(
         let mut claimed: Vec<D::N<'a>> = Vec::new();
 
         for rule in &pattern.rules {
-            let path = format!("descendant-or-self::node()/{}", rule.context);
+            let path = split_top_level_union(&rule.context)
+                .into_iter()
+                .map(|alternative| format!("descendant-or-self::node()/{}", alternative.trim()))
+                .collect::<Vec<_>>()
+                .join(" | ");
             let expr = xpath_eval::parse(&path).map_err(SchematronEvalError::Parse)?;
 
             let mut ctx = EvaluationContext::new(document.root());
@@ -478,6 +523,40 @@ mod tests {
         crate::parse(sch_xml).expect("test schema must parse")
     }
 
+    /// Builds `root -> wrapper -> item`, i.e. `item` is a *grandchild* of
+    /// the document root, not a direct child like `doc_with_root_children`
+    /// produces. Needed to distinguish `descendant-or-self::node()/X` (finds
+    /// `item` anywhere) from a bare, unprefixed `X` evaluated relative to
+    /// the root (would only find a direct root child literally named `X`) —
+    /// every other fixture in this module is flat, which happens to make
+    /// both forms equivalent and so cannot catch a union-context bug that
+    /// only manifests once a context alternative isn't parenthesized.
+    fn doc_with_nested_item() -> TestDoc {
+        let elements = vec![
+            ElementData {
+                namespace_uri: None,
+                local_name: String::new(),
+                parent: None,
+                children: vec![1],
+            },
+            ElementData {
+                namespace_uri: None,
+                local_name: "wrapper".to_owned(),
+                parent: Some(0),
+                children: vec![2],
+            },
+            ElementData {
+                namespace_uri: None,
+                local_name: "item".to_owned(),
+                parent: Some(1),
+                children: Vec::new(),
+            },
+        ];
+        TestDoc {
+            arena: Arena { elements },
+        }
+    }
+
     #[test]
     fn assert_true_produces_no_report() {
         let doc = doc_with_root_children(&[(None, "item")]);
@@ -517,6 +596,68 @@ mod tests {
         assert_eq!(report.kind, CheckKind::Assert);
         assert_eq!(report.message, "item is invalid");
         assert_eq!(report.node, doc.node(1));
+    }
+
+    /// A `context` with a `|`-union of two alternatives must match a node
+    /// through *either* alternative, no matter which one is written first —
+    /// same as a bare `context="item"` would for the same node. Regression
+    /// test for a real bug: `evaluate`/`evaluate_with_phase` built the path
+    /// as `format!("descendant-or-self::node()/{}", rule.context)` with no
+    /// parentheses around `rule.context`. XPath's `/` binds tighter than
+    /// `|`, so `descendant-or-self::node()/A | B` parsed as
+    /// `(descendant-or-self::node()/A) | B` — only the *first* alternative
+    /// got the document-wide prefix; every later alternative was evaluated
+    /// as a bare relative path from the document root, matching only a
+    /// direct root child literally named `B`. Every other context-union
+    /// test in this module happened to use `doc_with_root_children` (a flat
+    /// tree), which made a prefixed and an unprefixed match identical and
+    /// so never exposed this — `doc_with_nested_item` puts `item` two
+    /// levels down specifically to catch it.
+    #[test]
+    fn context_union_matches_through_every_alternative() {
+        let doc = doc_with_nested_item();
+
+        let first_alternative = schema(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule context="item | does-not-exist">
+                        <report test="true()">observed item</report>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        );
+        let reports = evaluate(&first_alternative, &doc).unwrap();
+        assert_eq!(reports.len(), 1, "item as the first union alternative");
+
+        let second_alternative = schema(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule context="does-not-exist | item">
+                        <report test="true()">observed item</report>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        );
+        let reports = evaluate(&second_alternative, &doc).unwrap();
+        assert_eq!(reports.len(), 1, "item as the second union alternative");
+    }
+
+    #[test]
+    fn split_top_level_union_ignores_nested_pipes() {
+        assert_eq!(split_top_level_union("item"), vec!["item"]);
+        assert_eq!(split_top_level_union("a | b | c"), vec!["a ", " b ", " c"]);
+        // A `|` inside a predicate (e.g. an attribute-value alternation)
+        // is not a context-level union and must not be split on.
+        assert_eq!(
+            split_top_level_union("a[@x = 'p|q']"),
+            vec!["a[@x = 'p|q']"]
+        );
+        assert_eq!(split_top_level_union("a[b | c]"), vec!["a[b | c]"]);
+        assert_eq!(split_top_level_union("(a | b)/c"), vec!["(a | b)/c"]);
+        assert_eq!(
+            split_top_level_union("a[@x = 'p|q'] | b"),
+            vec!["a[@x = 'p|q'] ", " b"]
+        );
     }
 
     #[test]

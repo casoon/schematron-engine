@@ -5,6 +5,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this
 project does not yet promise strict [SemVer](https://semver.org/) API
 stability (still `0.x`) but avoids breaking changes without a version bump.
 
+## 0.1.2 — fix: only the first alternative of a `context` union ever matched
+
+Real bug, found via `html-conform`'s Phase 08 corpus work: `context="a | b"`
+was evaluated as `descendant-or-self::node()/a | b` — XPath's `/` binds
+tighter than `|`, so only `a` got the document-wide
+`descendant-or-self::node()/` prefix. `b` was evaluated as a bare relative
+path from the document root, matching only a direct root child literally
+named `b` — in practice, never, since real targets are nested many levels
+down. Every rule using a `|`-union `context` silently matched through its
+first alternative only.
+
+No existing test caught this because every fixture in `engine.rs`'s test
+suite was flat (`doc_with_root_children`), which makes a
+`descendant-or-self::node()`-prefixed match and a bare relative match
+identical for a direct root child — the bug only manifests once the
+target is nested. Fixed by splitting `context` on top-level `|` (ignoring
+`|` inside `[...]`/`(...)`/quoted strings, via the new
+`split_top_level_union` helper) and prefixing each alternative
+individually. New regression tests: `context_union_matches_through_every_alternative`
+(uses a new `doc_with_nested_item` fixture, two levels down) and
+`split_top_level_union_ignores_nested_pipes`.
+
+No public API change — `evaluate`/`evaluate_with_phase` signatures are
+unchanged. Pure behavior fix: existing single-alternative contexts are
+unaffected; multi-alternative contexts now match strictly more nodes than
+before (any that were previously silently missed through a non-first
+alternative), never fewer.
+
 ## 0.1.1 — internal deduplication, no behavior change
 
 Refactor only — found via `cargo judge`'s duplicate-code analysis, driven
