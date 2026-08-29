@@ -296,13 +296,28 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Parses `xml` as a `roxmltree::Document`, mapping a malformed-XML error
+/// to [`ParseError::InvalidXml`] — the one place every top-level XML parse
+/// goes through (a schema's own text in [`parse`], and each resolved
+/// `<include>` fragment's text in [`resolve_includes`]).
+fn parse_xml_document(xml: &str) -> Result<roxmltree::Document<'_>, ParseError> {
+    roxmltree::Document::parse(xml).map_err(|error| ParseError::InvalidXml(error.to_string()))
+}
+
+/// Whether `node` is in the Schematron namespace — the one place every
+/// "is this really a Schematron element?" check goes through ([`parse`]'s
+/// own root-namespace check, [`resolve_includes`]'s check that a resolved
+/// `<include>` target is one too).
+fn is_schematron_element(node: Node<'_, '_>) -> bool {
+    node.tag_name().namespace() == Some(SCHEMATRON_NAMESPACE)
+}
+
 /// Parses a Schematron `.sch` XML document into a [`Schema`].
 pub fn parse(xml: &str) -> Result<Schema, ParseError> {
-    let document = roxmltree::Document::parse(xml)
-        .map_err(|error| ParseError::InvalidXml(error.to_string()))?;
+    let document = parse_xml_document(xml)?;
     let root = document.root_element();
 
-    if root.tag_name().namespace() != Some(SCHEMATRON_NAMESPACE) {
+    if !is_schematron_element(root) {
         return Err(ParseError::WrongRootNamespace {
             found: root.tag_name().namespace().map(str::to_owned),
             position: position_of(root),
@@ -481,8 +496,7 @@ fn resolve_includes(
     resolver: &impl SchemaResolver,
     loading: &mut HashSet<String>,
 ) -> Result<String, ParseError> {
-    let document = roxmltree::Document::parse(xml)
-        .map_err(|error| ParseError::InvalidXml(error.to_string()))?;
+    let document = parse_xml_document(xml)?;
 
     let includes: Vec<(Range<usize>, String, Position)> = document
         .root_element()
@@ -520,10 +534,9 @@ fn resolve_includes(
         loading.remove(&key);
         let resolved_text = resolved_text?;
 
-        let included_document = roxmltree::Document::parse(&resolved_text)
-            .map_err(|error| ParseError::InvalidXml(error.to_string()))?;
+        let included_document = parse_xml_document(&resolved_text)?;
         let included_root = included_document.root_element();
-        if included_root.tag_name().namespace() != Some(SCHEMATRON_NAMESPACE) {
+        if !is_schematron_element(included_root) {
             return Err(ParseError::InvalidInclude {
                 href,
                 reason: "included root element is not in the Schematron namespace",
@@ -551,10 +564,7 @@ fn resolve_includes(
 /// [`check_document_wide_id_uniqueness`], not here.
 fn parse_diagnostics_element(node: Node<'_, '_>) -> Result<Vec<Diagnostic>, ParseError> {
     validate_known_children(node, &["diagnostic"])?;
-    node.children()
-        .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "diagnostic")))
-        .map(parse_diagnostic)
-        .collect()
+    collect_children(node, "diagnostic", parse_diagnostic)
 }
 
 /// Parses a `<diagnostic id="..." role="...">` — same rich-content
@@ -574,10 +584,7 @@ fn parse_diagnostic(node: Node<'_, '_>) -> Result<Diagnostic, ParseError> {
 /// [`check_document_wide_id_uniqueness`], not here.
 fn parse_properties_element(node: Node<'_, '_>) -> Result<Vec<Property>, ParseError> {
     validate_known_children(node, PROPERTIES_ALLOWED_CHILDREN)?;
-    node.children()
-        .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "property")))
-        .map(parse_property)
-        .collect()
+    collect_children(node, "property", parse_property)
 }
 
 /// Parses a `<property id="..." role="..." scheme="...">` — same
