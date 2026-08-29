@@ -85,22 +85,34 @@ than silently doing the wrong thing:
 | Construct | Behavior |
 |---|---|
 | `<extends rule="...">` (same-schema rule reuse) | supported |
-| `<extends href="...">` (external-file rule reuse) | `MissingAttribute` (`extends` requires `@rule`; resolving `@href` would need a file/network I/O policy this crate deliberately doesn't have) |
-| `<let value="...">` | supported; `<let>` with literal-XML (`foreign-element+`) content instead of `value` is a `MissingAttribute` error |
-| `<name>`/`<emph>`/`<dir>`/`<span>` in messages | accepted as plain, inert text containers — their own text still contributes to the message, but their specific semantics (e.g. `<name/>` resolving to the context node's name) are not evaluated. Only `<value-of>` is |
+| `<extends href="...">` (external-file rule reuse) | `MissingAttribute` (`extends` requires `@rule`) — deliberately not wired up to `SchemaResolver` even though `<include>` now is: the ISO reference implementation (`iso_dsdl_include.xsl`) itself labels `extends[@href]` "experimental and non-standard", with substitution semantics that differ from `<include>` (splices the target's *children*, not the element itself) |
+| `<let value="...">` | supported (`LetValue::Expr`) |
+| `<let>` with literal-XML (`foreign-element+`) content instead of `value` | supported (`LetValue::Literal`) — bound as the content's string-value (concatenation of descendant text, like an XSLT 1.0 result-tree-fragment used as a string); not usable as a navigable node-set (no `exsl:node-set()`-equivalent escape hatch, consistent with implementing XPath 1.0 only) |
+| `<name>` in messages | evaluated — resolves to the named node's expanded name (`path="..."` selects a node other than the firing check's own context node, same as `<value-of select="...">`) |
+| `<emph>`/`<dir>`/`<span>` in messages | accepted as plain, inert text containers — purely presentational, no data-dependent semantics; their own text still contributes to the message, their tag does not |
 | `rule/@context` match-pattern semantics | reduced to `descendant-or-self::node()/context`, a location-path selection — covers the common case, not every exotic XSLT-match-pattern-style `context` |
-| `<include>` (schema composition) | `ParseError::UnexpectedElement` — silently ignoring it would produce an incomplete, wrongly-passing schema, so this is a hard error rather than a silent gap |
+| `<include href="...">` (schema composition) | `ParseError::UnexpectedElement` with plain `parse()` (unchanged — still a hard error, not a silent gap); supported end-to-end with `parse_with_resolver` given a caller-supplied `SchemaResolver` — splices the resolved root element in place, recursively. Only the common `href`-with-no-`#fragment` form resolving to a single Schematron-namespace root is supported; a `#fragment-id` cross-document lookup (the ISO reference implementation's own, itself-labeled-experimental extension) is not — `ParseError::UnresolvableInclude`/`CyclicInclude`/`InvalidInclude` cover the resolver-supplied failure modes |
+| `schema/@queryBinding` | read into `Schema.query_binding`; `"xslt"`/`"xpath"` (case-insensitive) — both XPath 1.0 — are accepted, anything else (e.g. `"xslt2"`, XPath 2.0) is `ParseError::UnsupportedQueryBinding` rather than silently evaluated as XPath 1.0 anyway |
 | Unknown or misplaced Schematron-namespace elements (typos, elements in the wrong container) | `ParseError::UnexpectedElement`, not silently dropped — `<title>`/`<p>` (prose/documentation) are accepted wherever ISO allows them, even though their content isn't read |
-| Duplicate `pattern/@id` or `diagnostic/@id` | `ParseError::DuplicateId` |
+| `<properties>`/`<property>` (ISO Schematron 2016 extension) | supported — `Schema.properties`; `assert\|report/@properties` (the parallel per-check IDREFS attribute) is not modeled, silently unread, same as several other `assert`/`report` attributes (`flag`, `subject`, ...) |
+| Duplicate `id` on `pattern`/`rule`/`assert`/`report`/`phase`/`diagnostic`/`property` | `ParseError::DuplicateId` — one shared, document-wide id space (real XML `ID` semantics), not one per element type |
 | `active/@pattern` referencing an unknown or abstract pattern id | `ParseError::UnknownActivePattern` |
 | `assert\|report/@diagnostics` referencing an unknown diagnostic id | `ParseError::UnknownDiagnosticReference` |
 | Foreign-namespace elements (any namespace other than Schematron's) | always allowed, anywhere — ISO's own "foreign" content model |
+
+In addition to this crate's own unit/integration tests, `tests/schxslt_testsuite.rs`
+runs a vendored, checksum-pinned, third-party conformance corpus
+(`tests/corpus/schxslt-testsuite/`, MIT-licensed — see its `UPSTREAM.md`)
+end to end. A handful of cases are skipped with a documented reason (see
+that test's `SKIP` list) — mostly constructs this table already lists as
+unsupported, plus two node kinds (`comment()`/`processing-instruction()`)
+the test-only fixture adapter doesn't model.
 
 ## Installation
 
 ```toml
 [dependencies]
-schematron-engine = "0.1"
+schematron-engine = "0.2"
 xpath-eval = "0.2" # implement Document/Node over your own document tree
 ```
 

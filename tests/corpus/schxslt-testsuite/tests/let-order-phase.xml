@@ -1,0 +1,23 @@
+<testcase xmlns="tag:dmaus@dmaus.name,2019:Schematron:Testsuite" id="let-order-phase" expectValid="true">
+  <label>Rule variable can use phase variable</label>
+  <reference>ISO Schematron 2016: Section 6.5 clause 6</reference>
+  <documents>
+    <document id="primary" filename="document.xml">
+      <element xmlns=""/>
+    </document>
+  </documents>
+  <schemas document="primary" phase="phase">
+    <sch:schema xmlns:sch="http://purl.oclc.org/dsdl/schematron">
+      <sch:phase id="phase">
+        <sch:let name="phase-var" value="1"/>
+        <sch:active pattern="pattern"/>
+      </sch:phase>
+      <sch:pattern id="pattern">
+        <sch:rule context="*">
+          <sch:let name="rule-var" value="$phase-var + 1"/>
+          <sch:assert test="$rule-var = 2"/>
+        </sch:rule>
+      </sch:pattern>
+    </sch:schema>
+  </schemas>
+</testcase>

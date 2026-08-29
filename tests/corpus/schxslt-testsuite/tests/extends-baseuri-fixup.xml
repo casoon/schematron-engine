@@ -1,0 +1,22 @@
+<testcase xmlns="tag:dmaus@dmaus.name,2019:Schematron:Testsuite" expectValid="false" id="extends-baseuri-fixup">
+  <label>Extends performs base URI fixup</label>
+  <documents>
+    <document id="primary" filename="document.xml">
+      <element xmlns=""/>
+    </document>
+    <document filename="subdir/include.sch">
+      <rule xmlns="http://purl.oclc.org/dsdl/schematron" context="/">
+        <report test="local-name(document('include.sch')/*[1]) = 'rule'"/>
+      </rule>
+    </document>
+  </documents>
+  <schemas document="primary">
+    <sch:schema xmlns:sch="http://purl.oclc.org/dsdl/schematron">
+      <sch:pattern>
+        <sch:rule context="/">
+          <sch:extends href="subdir/include.sch"/>
+        </sch:rule>
+      </sch:pattern>
+    </sch:schema>
+  </schemas>
+</testcase>

@@ -1,0 +1,25 @@
+<testcase xmlns="tag:dmaus@dmaus.name,2019:Schematron:Testsuite" expectValid="true" id="schema-default-phase-token">
+  <label>Phase #DEFAULT uses @defaultPhase</label>
+  <documents>
+    <document id="primary" filename="document.xml">
+      <element xmlns=""/>
+    </document>
+  </documents>
+  <schemas document="primary" phase="#DEFAULT">
+    <sch:schema xmlns:sch="http://purl.oclc.org/dsdl/schematron" defaultPhase="phase">
+      <sch:phase id="phase">
+        <sch:active pattern="pass"/>
+      </sch:phase>
+      <sch:pattern id="fail">
+        <sch:rule context="*">
+          <sch:assert test="false()"/>
+        </sch:rule>
+      </sch:pattern>
+      <sch:pattern id="pass">
+        <sch:rule context="*">
+          <sch:assert test="true()"/>
+        </sch:rule>
+      </sch:pattern>
+    </sch:schema>
+  </schemas>
+</testcase>

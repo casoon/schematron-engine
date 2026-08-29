@@ -1,0 +1,30 @@
+<testsuite xmlns="tag:dmaus@dmaus.name,2019:Schematron:Testsuite">
+  <label>Standard conformance</label>
+  <testcase href="tests/rule-context-attribute.xml"/>
+  <testcase href="tests/rule-context-comment.xml"/>
+  <testcase href="tests/rule-context-element.xml"/>
+  <testcase href="tests/rule-context-pi.xml"/>
+  <testcase href="tests/rule-context-root.xml"/>
+  <testcase href="tests/rule-context-text.xml"/>
+  <testcase href="tests/rule-order.xml"/>
+  <testcase href="tests/rule-abstract.xml"/>
+  <testcase href="tests/pattern-abstract.xml"/>
+  <testcase href="tests/pattern-documents.xml"/>
+  <testcase href="tests/schema-default-phase.xml"/>
+  <testcase href="tests/schema-default-phase-token.xml"/>
+  <testcase href="tests/let-element-content.xml"/>
+  <testcase href="tests/let-order-global.xml"/>
+  <testcase href="tests/let-order-pattern.xml"/>
+  <testcase href="tests/let-order-phase.xml"/>
+  <testcase href="tests/let-pattern-global.xml"/>
+  <testcase href="tests/svrl-value-of.xml"/>
+  <testcase href="tests/svrl-diagnostic-language.xml"/>
+  <testcase href="tests/svrl-diagnostic.xml"/>
+  <testcase href="tests/svrl-name-context.xml"/>
+  <testcase href="tests/svrl-name-path.xml"/>
+  <testcase href="tests/svrl-property.xml"/>
+  <testcase href="tests/extends-baseuri-fixup.xml"/>
+  <testcase href="tests/extends-recursive.xml"/>
+  <testcase href="tests/include-recursive.xml"/>
+  <testcase href="tests/include-baseuri-fixup.xml"/>
+</testsuite>

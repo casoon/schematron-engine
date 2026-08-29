@@ -44,7 +44,7 @@ use std::collections::HashMap;
 
 use xpath_eval::{Document, EvaluationContext, Node, QName, Value};
 
-use crate::schema::{Check, CheckKind, Diagnostic, LetBinding, MessagePart, Schema};
+use crate::schema::{Check, CheckKind, Diagnostic, LetBinding, LetValue, MessagePart, Schema};
 
 /// One fired check: a failed `assert`, or a true-evaluating `report`.
 /// Checks that do not fire are not represented at all (no `fired: bool`
@@ -218,7 +218,23 @@ pub fn evaluate_with_phase<'a, D: Document>(
         for rule in &pattern.rules {
             let path = split_top_level_union(&rule.context)
                 .into_iter()
-                .map(|alternative| format!("descendant-or-self::node()/{}", alternative.trim()))
+                .map(|alternative| {
+                    let alternative = alternative.trim();
+                    // A bare "/" (ISO's root pattern — match only the
+                    // document root) is the one case the general
+                    // `descendant-or-self::node()/` prefix breaks outright
+                    // rather than just loosening: prefixed, it becomes
+                    // `descendant-or-self::node()//`, a trailing `//` with
+                    // no following step — a parse error, not just an
+                    // overly-permissive match (issue #11). `/` alone is
+                    // already exactly "the document root", so it's used
+                    // unprefixed instead.
+                    if alternative == "/" {
+                        "/".to_owned()
+                    } else {
+                        format!("descendant-or-self::node()/{alternative}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" | ");
             let expr = xpath_eval::parse(&path).map_err(SchematronEvalError::Parse)?;
@@ -305,7 +321,12 @@ fn extend_lets<'n, N: Node<'n>>(
     ns_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(), SchematronEvalError> {
     for binding in lets {
-        let value = evaluate_xpath(&binding.value, context_node, ns_lookup, vars)?;
+        let value = match &binding.value {
+            LetValue::Expr(expr) => evaluate_xpath(expr, context_node, ns_lookup, vars)?,
+            // issue #3: literal-XML content binds as its pre-computed
+            // string-value — see `LetValue::Literal`'s doc comment.
+            LetValue::Literal(text) => Value::String(text.clone()),
+        };
         vars.insert(binding.name.clone(), value);
     }
     Ok(())
@@ -357,12 +378,16 @@ fn evaluate_check<'n, N: Node<'n>>(
 /// Renders a [`Check`]'s message `parts` against `node` — `MessagePart::Text`
 /// is appended as-is, `MessagePart::ValueOf`'s `select` is parsed and
 /// evaluated against `node` (with the same namespace/variable hooks as the
-/// check's own `test`) and its `Value::to_xpath_string()` appended — then
-/// the whole concatenated result is trimmed (leading/trailing whitespace
-/// only, see `plan/06-value-of-interpolation.md` for why trimming moved
-/// here from parse time). Only called for checks that actually fire (see
-/// call site) — a broken `value-of` in a message that never fires must not
-/// surface as an error.
+/// check's own `test`) and its `Value::to_xpath_string()` appended,
+/// `MessagePart::Name`'s `path` (or `node` itself, absent a `path`) resolves
+/// to the named node's expanded name via XPath's own `name()` function
+/// (issue #4 — reuses `xpath-eval`'s existing `name()`/`qname_string`
+/// implementation rather than reimplementing qualified-name formatting
+/// here) — then the whole concatenated result is trimmed (leading/trailing
+/// whitespace only, see `plan/06-value-of-interpolation.md` for why
+/// trimming moved here from parse time). Only called for checks that
+/// actually fire (see call site) — a broken `value-of`/`name` in a message
+/// that never fires must not surface as an error.
 fn render_message<'n, N: Node<'n>>(
     parts: &[MessagePart],
     node: N,
@@ -375,6 +400,14 @@ fn render_message<'n, N: Node<'n>>(
             MessagePart::Text(text) => message.push_str(text),
             MessagePart::ValueOf(select) => {
                 let value = evaluate_xpath(select, node, ns_lookup, vars)?;
+                message.push_str(&value.to_xpath_string());
+            }
+            MessagePart::Name(path) => {
+                let select = match path {
+                    Some(path) => format!("name({path})"),
+                    None => "name()".to_owned(),
+                };
+                let value = evaluate_xpath(&select, node, ns_lookup, vars)?;
                 message.push_str(&value.to_xpath_string());
             }
         }
@@ -861,6 +894,28 @@ mod tests {
         assert_eq!(messages, vec!["SEQUENTIAL"]);
     }
 
+    /// Issue #3, end-to-end: a `<let>` bound to literal-XML content is
+    /// usable in a `test` expression via its string-value, same as any
+    /// other string.
+    #[test]
+    fn literal_xml_let_is_usable_as_a_string_in_a_test_expression() {
+        let doc = doc_with_root_children(&[(None, "item")]);
+        let schema = schema(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <let name="x"><foo>literal</foo></let>
+                <pattern>
+                    <rule context="item">
+                        <report test="$x = 'literal'">LITERAL-LET</report>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        );
+
+        let reports = evaluate(&schema, &doc).unwrap();
+        let messages: Vec<&str> = reports.iter().map(|r| r.message.as_str()).collect();
+        assert_eq!(messages, vec!["LITERAL-LET"]);
+    }
+
     #[test]
     fn unbound_variable_is_an_eval_error_not_a_panic() {
         let doc = doc_with_root_children(&[(None, "item")]);
@@ -1029,6 +1084,48 @@ mod tests {
         assert_eq!(reports[0].message, "Element: item.");
     }
 
+    /// Issue #4: a self-closing `<name/>` resolves to the firing check's
+    /// own context node's name.
+    #[test]
+    fn name_resolves_to_the_context_node_name() {
+        let doc = doc_with_root_children(&[(None, "item")]);
+        let schema = schema(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule context="item">
+                        <assert test="false()">Element <name/> is invalid.</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        );
+
+        let reports = evaluate(&schema, &doc).unwrap();
+        assert_eq!(reports[0].message, "Element item is invalid.");
+    }
+
+    /// The counter-case: `<name path="...">` resolves to a *different*
+    /// node's name than the firing check's own context node.
+    #[test]
+    fn name_with_path_resolves_to_a_different_node() {
+        let doc = doc_with_root_children(&[(None, "item")]);
+        let schema = schema(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule context="item">
+                        <assert test="false()">Parent is <name path=".."/>.</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        );
+
+        let reports = evaluate(&schema, &doc).unwrap();
+        // The root test node has an empty local name (see `TestNode`/
+        // `doc_with_root_children`) — proves `path` is actually evaluated
+        // against a different node than `.` (the context node, "item"),
+        // not just ignored.
+        assert_eq!(reports[0].message, "Parent is .");
+    }
+
     #[test]
     fn value_of_can_reference_a_let_variable() {
         let doc = doc_with_root_children(&[(None, "item")]);
@@ -1108,6 +1205,31 @@ mod tests {
         let reports = evaluate(&schema, &doc).unwrap();
         let messages: Vec<&str> = reports.iter().map(|r| r.message.as_str()).collect();
         assert_eq!(messages, vec!["FROM-BASE"]);
+    }
+
+    /// End-to-end (issue #7): a `<let>` declared in an abstract rule pulled
+    /// in via `<extends>` is visible to the extending rule's own `test`
+    /// expressions, not just its inlined checks.
+    #[test]
+    fn extends_inlined_let_is_visible_to_own_checks() {
+        let doc = doc_with_root_children(&[(None, "item")]);
+        let schema = schema(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule abstract="true" id="base">
+                        <let name="x" value="'from-base'"/>
+                    </rule>
+                    <rule context="item">
+                        <extends rule="base"/>
+                        <report test="$x = 'from-base'">INHERITED-LET</report>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        );
+
+        let reports = evaluate(&schema, &doc).unwrap();
+        let messages: Vec<&str> = reports.iter().map(|r| r.message.as_str()).collect();
+        assert_eq!(messages, vec!["INHERITED-LET"]);
     }
 
     /// End-to-end: an `is-a`-instantiated abstract pattern evaluates with

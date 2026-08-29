@@ -1,0 +1,20 @@
+<testcase xmlns="tag:dmaus@dmaus.name,2019:Schematron:Testsuite" expectValid="true" id="let-order-global">
+  <label>Rule variable can use global variable</label>
+  <reference>ISO Schematron 2016: Section 6.5 clause 6</reference>
+  <documents>
+    <document id="primary" filename="document.xml">
+      <element xmlns=""/>
+    </document>
+  </documents>
+  <schemas document="primary">
+    <sch:schema xmlns:sch="http://purl.oclc.org/dsdl/schematron">
+      <sch:let name="global-var" value="1"/>
+      <sch:pattern>
+        <sch:rule context="*">
+          <sch:let name="rule-var" value="$global-var + 1"/>
+          <sch:assert test="$rule-var = 2"/>
+        </sch:rule>
+      </sch:pattern>
+    </sch:schema>
+  </schemas>
+</testcase>

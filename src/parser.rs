@@ -4,15 +4,86 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::Range;
 
 use roxmltree::Node;
 
+use crate::resolver::SchemaResolver;
 use crate::schema::{
-    Check, CheckKind, Diagnostic, LetBinding, MessagePart, NamespaceBinding, Pattern, Phase, Rule,
-    Schema,
+    Check, CheckKind, Diagnostic, LetBinding, LetValue, MessagePart, NamespaceBinding, Pattern,
+    Phase, Property, Rule, Schema,
 };
 
 const SCHEMATRON_NAMESPACE: &str = "http://purl.oclc.org/dsdl/schematron";
+
+/// `schema/@queryBinding` values this crate treats as equivalent to
+/// XPath 1.0 (case-insensitive), issue #6. The ISO grammar types
+/// `queryBinding` as an unconstrained non-empty string (implementation-
+/// defined values are legal), but this crate only evaluates XPath 1.0
+/// (via `xpath-eval`) — `"xslt"` is the ISO-conventional default/XPath-1.0
+/// binding name, `"xpath"` the common informal shorthand for the same;
+/// anything else (e.g. `"xslt2"`/`"xpath2"`, XPath 2.0) is rejected with
+/// `ParseError::UnsupportedQueryBinding` rather than silently
+/// misinterpreted as XPath 1.0.
+const XPATH1_QUERY_BINDINGS: &[&str] = &["xslt", "xpath"];
+
+/// Schematron elements whose `id` attribute is `xsd:ID`-typed per the ISO
+/// RNC grammar (verified against the real grammar,
+/// `github.com/Schematron/schema/blob/main/schematron.rnc` — `schema/@id`
+/// and `p/@id` are `xsd:ID`-typed too, but this crate does not parse or
+/// otherwise model either attribute at all, so there is nothing to check
+/// uniqueness *of* for them). Real XML `ID` semantics are a single,
+/// document-wide namespace, not one per element type — see
+/// [`check_document_wide_id_uniqueness`] (issue #8).
+const ID_TYPED_ELEMENTS: &[&str] = &[
+    "pattern",
+    "rule",
+    "assert",
+    "report",
+    "phase",
+    "diagnostic",
+    "property",
+];
+
+/// Walks every Schematron-namespace element in the whole document once
+/// (`root.descendants()`, itself included, in document order), checking
+/// `id` attributes on [`ID_TYPED_ELEMENTS`] for a document-wide collision —
+/// real XML `ID` semantics (issue #8; supersedes three previously separate,
+/// narrower checks — `pattern/@id` in the pattern-parsing loop below,
+/// `diagnostic/@id` in `parse_diagnostics_element`, `property/@id` in
+/// `parse_properties_element` — and additionally catches two cases those
+/// never did: `rule/@id`/`assert|report/@id` collisions, and an abstract
+/// `pattern/@id` colliding with anything, concrete or abstract).
+///
+/// Not affected by this crate's own later *semantic* reuse of a parsed
+/// element (`is-a` pattern instantiation, `<extends>` rule inlining): both
+/// act on the parsed model, not the source XML tree, so neither ever
+/// duplicates a physical element and can't trigger a false positive here —
+/// this walks the raw tree once, before any of that happens.
+fn check_document_wide_id_uniqueness(root: Node<'_, '_>) -> Result<(), ParseError> {
+    let mut seen: HashSet<String> = HashSet::new();
+    for node in root.descendants() {
+        if !node.is_element() || node.tag_name().namespace() != Some(SCHEMATRON_NAMESPACE) {
+            continue;
+        }
+        let Some(&element) = ID_TYPED_ELEMENTS
+            .iter()
+            .find(|&&tag| node.has_tag_name((SCHEMATRON_NAMESPACE, tag)))
+        else {
+            continue;
+        };
+        if let Some(id) = node.attribute("id")
+            && !seen.insert(id.to_owned())
+        {
+            return Err(ParseError::DuplicateId {
+                element,
+                id: id.to_owned(),
+                position: position_of(node),
+            });
+        }
+    }
+    Ok(())
+}
 
 // Direct-child allowlists per container, verified against the ISO
 // Schematron RNC grammar (`github.com/Schematron/schema`; source
@@ -22,8 +93,17 @@ const SCHEMATRON_NAMESPACE: &str = "http://purl.oclc.org/dsdl/schematron";
 // typo or an unimplemented ISO construct (e.g. `<include>`) — both become
 // `ParseError::UnexpectedElement` (see `validate_known_children`), not a
 // silent drop. Foreign-namespace elements are unaffected by this list.
-const SCHEMA_ALLOWED_CHILDREN: &[&str] =
-    &["title", "p", "ns", "let", "phase", "pattern", "diagnostics"];
+const SCHEMA_ALLOWED_CHILDREN: &[&str] = &[
+    "title",
+    "p",
+    "ns",
+    "let",
+    "phase",
+    "pattern",
+    "diagnostics",
+    "properties",
+];
+const PROPERTIES_ALLOWED_CHILDREN: &[&str] = &["property"];
 const PATTERN_ALLOWED_CHILDREN: &[&str] = &["title", "p", "let", "rule"];
 /// A `<pattern is-a="...">` *use* site has a different content model than
 /// a pattern definition — `param*`, not `rule*`.
@@ -99,6 +179,38 @@ pub enum ParseError {
     /// `assert|report/@diagnostics` referenced a diagnostic id with no
     /// matching `<diagnostic id="...">` in the schema.
     UnknownDiagnosticReference { id: String, position: Position },
+    /// `schema/@queryBinding` named a query language binding this crate
+    /// does not treat as equivalent to XPath 1.0 (issue #6) — evaluating
+    /// `test`/`context`/`select` expressions as XPath 1.0 anyway would
+    /// silently misinterpret a schema that explicitly opted into a
+    /// different query language (e.g. `"xslt2"`, XPath 2.0). See
+    /// `README.md`'s support matrix for the accepted binding names.
+    UnsupportedQueryBinding { binding: String, position: Position },
+    /// [`crate::parse_with_resolver`] found an `<include href="...">` it
+    /// had already started resolving further up the same inclusion chain
+    /// (issue #2) — `A` includes `B` includes `A`, directly or
+    /// transitively.
+    CyclicInclude { href: String, position: Position },
+    /// [`crate::parse_with_resolver`]'s [`SchemaResolver`] failed to
+    /// resolve an `<include href="...">` (issue #2) — not found, not
+    /// readable, or disallowed by the resolver's own policy; `message` is
+    /// the resolver's [`crate::ResolveError`], rendered.
+    UnresolvableInclude {
+        href: String,
+        message: String,
+        position: Position,
+    },
+    /// An `<include href="...">` (issue #2) resolved to content this
+    /// crate refuses to splice in: either the resolved root element isn't
+    /// in the Schematron namespace at all, or it's a whole `<schema>`
+    /// (the ISO reference implementation, `iso_dsdl_include.xsl`, treats
+    /// this the same way: "use include to include fragments, not a whole
+    /// schema").
+    InvalidInclude {
+        href: String,
+        reason: &'static str,
+        position: Position,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -155,6 +267,29 @@ impl fmt::Display for ParseError {
                 formatter,
                 "diagnostics references unknown diagnostic `{id}` at {position}"
             ),
+            ParseError::UnsupportedQueryBinding { binding, position } => write!(
+                formatter,
+                "schema/@queryBinding `{binding}` at {position} is not equivalent to XPath 1.0 (only `xslt`/`xpath`, or an absent queryBinding, are accepted — see README.md)"
+            ),
+            ParseError::CyclicInclude { href, position } => {
+                write!(formatter, "cyclic include involving `{href}` at {position}")
+            }
+            ParseError::UnresolvableInclude {
+                href,
+                message,
+                position,
+            } => write!(
+                formatter,
+                "could not resolve <include href=\"{href}\"> at {position}: {message}"
+            ),
+            ParseError::InvalidInclude {
+                href,
+                reason,
+                position,
+            } => write!(
+                formatter,
+                "<include href=\"{href}\"> at {position} is invalid: {reason}"
+            ),
         }
     }
 }
@@ -176,11 +311,25 @@ pub fn parse(xml: &str) -> Result<Schema, ParseError> {
 
     validate_known_children(root, SCHEMA_ALLOWED_CHILDREN)?;
 
+    check_document_wide_id_uniqueness(root)?;
+
     let ns = collect_children(root, "ns", parse_ns)?;
 
     let lets = collect_lets(root)?;
 
     let default_phase = root.attribute("defaultPhase").map(str::to_owned);
+
+    let query_binding = root.attribute("queryBinding").map(str::to_owned);
+    if let Some(binding) = &query_binding
+        && !XPATH1_QUERY_BINDINGS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(binding))
+    {
+        return Err(ParseError::UnsupportedQueryBinding {
+            binding: binding.clone(),
+            position: position_of(root),
+        });
+    }
 
     // Diagnostics are parsed before patterns so `assert|report/@diagnostics`
     // IDREFS can be validated against a complete `diagnostic/@id` set while
@@ -192,6 +341,13 @@ pub fn parse(xml: &str) -> Result<Schema, ParseError> {
         .transpose()?
         .unwrap_or_default();
     let diagnostic_ids: HashSet<String> = diagnostics.iter().map(|d| d.id.clone()).collect();
+
+    let properties = root
+        .children()
+        .find(|node| node.has_tag_name((SCHEMATRON_NAMESPACE, "properties")))
+        .map(parse_properties_element)
+        .transpose()?
+        .unwrap_or_default();
 
     // Abstract patterns (`plan/07-abstract-patterns-and-extends.md`) are
     // schema-wide templates, looked up by `is-a` regardless of where in
@@ -213,10 +369,11 @@ pub fn parse(xml: &str) -> Result<Schema, ParseError> {
         })
         .collect::<Result<_, _>>()?;
 
-    // Tracks concrete `pattern/@id`s as they're parsed, both to reject a
-    // duplicate the moment it's seen (with that pattern's own position,
-    // not the earlier one's) and to build the id set `parse_phase`/
-    // `parse_active` validate `active/@pattern` against below.
+    // Tracks concrete `pattern/@id`s as they're parsed, to build the id set
+    // `parse_phase`/`parse_active` validate `active/@pattern` against below
+    // (duplicates are already rejected by `check_document_wide_id_uniqueness`
+    // above, with that pattern's own position — nothing left to reject
+    // here).
     let mut pattern_ids: HashSet<String> = HashSet::new();
 
     let patterns: Vec<Pattern> = root
@@ -227,14 +384,8 @@ pub fn parse(xml: &str) -> Result<Schema, ParseError> {
         })
         .map(|node| {
             let id = node.attribute("id").map(str::to_owned);
-            if let Some(id) = &id
-                && !pattern_ids.insert(id.clone())
-            {
-                return Err(ParseError::DuplicateId {
-                    element: "pattern",
-                    id: id.clone(),
-                    position: position_of(node),
-                });
+            if let Some(id) = &id {
+                pattern_ids.insert(id.clone());
             }
 
             if let Some(is_a) = node.attribute("is-a") {
@@ -266,29 +417,143 @@ pub fn parse(xml: &str) -> Result<Schema, ParseError> {
         phases,
         patterns,
         diagnostics,
+        properties,
+        query_binding,
     })
+}
+
+/// Parses a Schematron `.sch` XML document into a [`Schema`], first
+/// resolving every `<include href="...">` in it (issue #2) via `resolver`
+/// — unlike [`parse`], which treats `<include>` as an unsupported,
+/// unexpected element (`ParseError::UnexpectedElement`), same as a typo.
+///
+/// `base_uri` is the base URI `xml`'s own top-level `href`s resolve
+/// against (this crate has no notion of "the schema's own file path" — it
+/// never reads files itself, see [`crate::SchemaResolver`] — so the caller
+/// supplies it, exactly mirroring [`crate::SchemaSource::new`]'s own
+/// `base_uri` parameter for nested includes).
+///
+/// Resolution is a pure text-substitution pass (`resolve_includes`) that
+/// runs *before* any structural parsing: every `<include href="...">` is
+/// replaced, in place, by the XML text of its resolved root element,
+/// recursively (an included fragment's own `<include>`s are resolved too,
+/// against its own base URI) — then the fully-expanded text is parsed
+/// exactly like a [`parse`] call, so every existing structural check
+/// (`validate_known_children` and friends) still applies to the expanded
+/// result: an included fragment of the wrong kind for where it was
+/// included (e.g. a whole `<pattern>` included at rule level, where only
+/// `assert`/`report`/`extends`/`p` belong) still surfaces as the same
+/// `ParseError::UnexpectedElement` it would if it had been written inline.
+///
+/// Only the common, unambiguous form is supported: `href` with no
+/// `#fragment-id`, resolving to a *single* Schematron-namespace root
+/// element (anything else — a non-Schematron-namespace root, or a whole
+/// `<schema>` — is [`ParseError::InvalidInclude`]). The ISO reference
+/// implementation's `#fragment-id` cross-document lookup form
+/// (`iso_dsdl_include.xsl`) is not implemented — deferred, not silently
+/// mishandled: an `href` containing `#` is resolved as a literal,
+/// almost-certainly-nonexistent resource name and surfaces as
+/// [`ParseError::UnresolvableInclude`] via the caller's own
+/// [`SchemaResolver`], not silently ignored.
+pub fn parse_with_resolver(
+    xml: &str,
+    base_uri: &str,
+    resolver: &impl SchemaResolver,
+) -> Result<Schema, ParseError> {
+    let mut loading = HashSet::new();
+    let expanded = resolve_includes(xml, base_uri, resolver, &mut loading)?;
+    parse(&expanded)
+}
+
+/// The text-substitution pass behind [`parse_with_resolver`] — see its doc
+/// comment for the overall approach and scope. Splices every top-level
+/// `<include href="...">` in `xml` (there can be no *nested* `<include>`s
+/// within one `<include>` element itself: the ISO grammar declares it
+/// `foreign-empty`, so `<include>` is always a leaf) with the XML text of
+/// its resolved root element, recursing into the resolved text first (so
+/// the spliced-in text is itself already fully expanded) before splicing.
+/// `loading` is the cycle guard, keyed `"{base_uri}::{href}"` (same
+/// convention as the sister crate `relax-ng`'s own `include`/`externalRef`
+/// cycle guard).
+fn resolve_includes(
+    xml: &str,
+    base_uri: &str,
+    resolver: &impl SchemaResolver,
+    loading: &mut HashSet<String>,
+) -> Result<String, ParseError> {
+    let document = roxmltree::Document::parse(xml)
+        .map_err(|error| ParseError::InvalidXml(error.to_string()))?;
+
+    let includes: Vec<(Range<usize>, String, Position)> = document
+        .root_element()
+        .descendants()
+        .filter(|node| node.has_tag_name((SCHEMATRON_NAMESPACE, "include")))
+        .map(|node| {
+            let href = required_attribute(node, "include", "href")?.to_owned();
+            Ok((node.range(), href, position_of(node)))
+        })
+        .collect::<Result<_, ParseError>>()?;
+
+    if includes.is_empty() {
+        return Ok(xml.to_owned());
+    }
+
+    let mut result = String::with_capacity(xml.len());
+    let mut cursor = 0usize;
+    for (range, href, position) in includes {
+        result.push_str(&xml[cursor..range.start]);
+
+        let key = format!("{base_uri}::{href}");
+        if !loading.insert(key.clone()) {
+            return Err(ParseError::CyclicInclude { href, position });
+        }
+        let resolved_text = resolver
+            .resolve(&href, base_uri)
+            .map_err(|error| ParseError::UnresolvableInclude {
+                href: href.clone(),
+                message: error.to_string(),
+                position,
+            })
+            .and_then(|source| {
+                resolve_includes(source.text(), source.base_uri(), resolver, loading)
+            });
+        loading.remove(&key);
+        let resolved_text = resolved_text?;
+
+        let included_document = roxmltree::Document::parse(&resolved_text)
+            .map_err(|error| ParseError::InvalidXml(error.to_string()))?;
+        let included_root = included_document.root_element();
+        if included_root.tag_name().namespace() != Some(SCHEMATRON_NAMESPACE) {
+            return Err(ParseError::InvalidInclude {
+                href,
+                reason: "included root element is not in the Schematron namespace",
+                position,
+            });
+        }
+        if included_root.has_tag_name((SCHEMATRON_NAMESPACE, "schema")) {
+            return Err(ParseError::InvalidInclude {
+                href,
+                reason: "included content must be a fragment, not a whole <schema> (ISO reference: \"use include to include fragments, not a whole schema\")",
+                position,
+            });
+        }
+        result.push_str(&resolved_text[included_root.range()]);
+
+        cursor = range.end;
+    }
+    result.push_str(&xml[cursor..]);
+    Ok(result)
 }
 
 /// Parses a `<diagnostics><diagnostic id="..." role="...">...</diagnostic>
 /// ...</diagnostics>` element into its `diagnostic` children. A repeated
-/// `diagnostic/@id` is a [`ParseError::DuplicateId`] — an ambiguous target
-/// for `assert|report/@diagnostics`.
+/// `diagnostic/@id` is a [`ParseError::DuplicateId`], raised earlier by
+/// [`check_document_wide_id_uniqueness`], not here.
 fn parse_diagnostics_element(node: Node<'_, '_>) -> Result<Vec<Diagnostic>, ParseError> {
     validate_known_children(node, &["diagnostic"])?;
-    let mut seen = HashSet::new();
     node.children()
         .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "diagnostic")))
-        .map(|child| {
-            let diagnostic = parse_diagnostic(child)?;
-            if !seen.insert(diagnostic.id.clone()) {
-                return Err(ParseError::DuplicateId {
-                    element: "diagnostic",
-                    id: diagnostic.id,
-                    position: position_of(child),
-                });
-            }
-            Ok(diagnostic)
-        })
+        .map(parse_diagnostic)
         .collect()
 }
 
@@ -302,9 +567,38 @@ fn parse_diagnostic(node: Node<'_, '_>) -> Result<Diagnostic, ParseError> {
     Ok(Diagnostic { id, role, message })
 }
 
+/// Parses a `<properties><property id="..." role="..." scheme="...">
+/// ...</property>...</properties>` element (ISO Schematron 2016 extension,
+/// issue #5) into its `property` children. A repeated `property/@id` is a
+/// [`ParseError::DuplicateId`], raised earlier by
+/// [`check_document_wide_id_uniqueness`], not here.
+fn parse_properties_element(node: Node<'_, '_>) -> Result<Vec<Property>, ParseError> {
+    validate_known_children(node, PROPERTIES_ALLOWED_CHILDREN)?;
+    node.children()
+        .filter(|child| child.has_tag_name((SCHEMATRON_NAMESPACE, "property")))
+        .map(parse_property)
+        .collect()
+}
+
+/// Parses a `<property id="..." role="..." scheme="...">` — same
+/// rich-content message model as [`parse_diagnostic`], plus the
+/// `property`-specific `scheme` attribute.
+fn parse_property(node: Node<'_, '_>) -> Result<Property, ParseError> {
+    let id = required_attribute(node, "property", "id")?.to_owned();
+    let scheme = node.attribute("scheme").map(str::to_owned);
+    let (role, message) = parse_role_and_message(node, &[])?;
+    Ok(Property {
+        id,
+        role,
+        scheme,
+        message,
+    })
+}
+
 /// Reads the optional `role="..."` attribute and the rich-content message
-/// body — shared by [`parse_diagnostic`] and [`parse_check`], the two
-/// element kinds with that exact `role`/message-content shape.
+/// body — shared by [`parse_diagnostic`], [`parse_property`], and
+/// [`parse_check`], the element kinds with that exact `role`/message-content
+/// shape.
 fn parse_role_and_message(
     node: Node<'_, '_>,
     params: &[(String, String)],
@@ -325,15 +619,53 @@ fn parse_ns(node: Node<'_, '_>) -> Result<NamespaceBinding, ParseError> {
     Ok(NamespaceBinding { prefix, uri })
 }
 
-/// Parses a `<let name="..." value="...">` binding. Only the
-/// `value`-attribute form is supported (see `plan/04-let-bindings.md`) —
-/// the grammar's alternative `foreign-element+` literal-XML-content form
-/// is out of scope, and a `<let>` without `value` is a regular
-/// `MissingAttribute` error, not a silent fallback.
+/// Parses a `<let name="..." value="...">` or `<let name="...">`-with-
+/// literal-XML-content binding (issue #3 — the grammar's
+/// `(attribute value { string } | foreign-element+)` alternative). A
+/// `<let>` with neither a `value` attribute nor any element child is a
+/// regular `MissingAttribute` error, not a silent fallback — matches this
+/// crate's existing "missing required info is always an error" convention
+/// (same as before issue #3, when only the `value`-attribute form was
+/// supported at all). A `<let>` with only whitespace/text content and no
+/// element child is treated the same way (`foreign-element+` requires at
+/// least one actual *element*, per the grammar) — deliberately, so a
+/// `<let name="x">  </let>` (a forgotten `value` attribute, indentation
+/// whitespace mistaken for content) still errors instead of silently
+/// binding `$x` to an empty string.
 fn parse_let(node: Node<'_, '_>) -> Result<LetBinding, ParseError> {
     let name = required_attribute(node, "let", "name")?.to_owned();
-    let value = required_attribute(node, "let", "value")?.to_owned();
+    let value = if let Some(value) = node.attribute("value") {
+        LetValue::Expr(value.to_owned())
+    } else if node.children().any(|child| child.is_element()) {
+        LetValue::Literal(collect_literal_text(node))
+    } else {
+        return Err(ParseError::MissingAttribute {
+            element: "let",
+            attribute: "value",
+            position: position_of(node),
+        });
+    };
     Ok(LetBinding { name, value })
+}
+
+/// Computes the string-value of a `<let>`'s literal-XML content
+/// (`LetValue::Literal`, issue #3) — XPath's own string-value-of-a-node
+/// algorithm: the concatenation of every descendant text node's content,
+/// in document order, regardless of element nesting depth. Matches how
+/// XSLT 1.0 treats a variable bound to a result-tree-fragment by default
+/// when used as a string (see [`LetValue::Literal`]'s doc comment).
+fn collect_literal_text(node: Node<'_, '_>) -> String {
+    let mut text = String::new();
+    for child in node.children() {
+        if child.is_text() {
+            if let Some(t) = child.text() {
+                text.push_str(t);
+            }
+        } else if child.is_element() {
+            text.push_str(&collect_literal_text(child));
+        }
+    }
+    text
 }
 
 /// Parses a `<phase id="..."><active pattern="..."/>...</phase>` element.
@@ -429,8 +761,6 @@ fn parse_rule(
 
     let context = substitute(required_attribute(node, "rule", "context")?, params);
 
-    let lets = collect_lets(node)?;
-
     // Cycle guard for <extends>, seeded with this rule's own id so a
     // direct self-extends is caught the same way as a transitive one.
     let mut visiting: Vec<String> = node
@@ -440,12 +770,14 @@ fn parse_rule(
         .collect();
 
     let mut checks = Vec::new();
+    let mut lets = Vec::new();
     collect_checks(
         node,
         rule_index,
         params,
         &mut visiting,
         &mut checks,
+        &mut lets,
         diagnostic_ids,
     )?;
 
@@ -457,22 +789,37 @@ fn parse_rule(
 }
 
 /// Walks `node`'s children collecting `assert`/`report` as [`Check`]s and
-/// inlining `<extends rule="X">` by recursively collecting `X`'s own
-/// checks at that position (see `plan/07-abstract-patterns-and-extends.md`
-/// — `X` must be declared in the same pattern, i.e. present in
-/// `rule_index`; `X`'s own `<let>`s are not carried over). `visiting`
-/// guards against cycles (`X` extending something already being resolved).
+/// `<let>` as [`LetBinding`]s, inlining `<extends rule="X">` by recursively
+/// collecting `X`'s own checks *and* lets at that position (see
+/// `plan/07-abstract-patterns-and-extends.md` — `X` must be declared in the
+/// same pattern, i.e. present in `rule_index`). An extended rule's `<let>`s
+/// are carried over exactly like its checks are — same recursive-inlining
+/// mechanism, so a `<let>` in a transitively-extended abstract rule is
+/// visible too (issue #7). Both `checks` and `lets` end up ordered by where
+/// the contributing `<assert>`/`<report>`/`<let>`/`<extends>` sits in
+/// document order, walking into an `<extends>` at the position it appears —
+/// the same convention already used for checks, extended here to `<let>`:
+/// an inherited `<let>` before this rule's own `<let name="x">` of the same
+/// name is shadowed by it (later wins, see `extend_lets` in `engine.rs`),
+/// an inherited one *after* an own `<let>` of the same name shadows it
+/// instead — purely a function of where the author placed `<extends>`
+/// relative to their own `<let>`s, not a fixed "own always wins" rule.
+/// `visiting` guards against cycles (`X` extending something already being
+/// resolved).
 fn collect_checks(
     node: Node<'_, '_>,
     rule_index: &HashMap<String, Node<'_, '_>>,
     params: &[(String, String)],
     visiting: &mut Vec<String>,
     checks: &mut Vec<Check>,
+    lets: &mut Vec<LetBinding>,
     diagnostic_ids: &HashSet<String>,
 ) -> Result<(), ParseError> {
     for child in node.children() {
         if let Some(kind) = check_kind(child) {
             checks.push(parse_check(kind, child, params, diagnostic_ids)?);
+        } else if child.has_tag_name((SCHEMATRON_NAMESPACE, "let")) {
+            lets.push(parse_let(child)?);
         } else if child.has_tag_name((SCHEMATRON_NAMESPACE, "extends")) {
             let target_id =
                 child
@@ -495,7 +842,15 @@ fn collect_checks(
                 });
             }
             visiting.push(target_id.to_owned());
-            collect_checks(target, rule_index, params, visiting, checks, diagnostic_ids)?;
+            collect_checks(
+                target,
+                rule_index,
+                params,
+                visiting,
+                checks,
+                lets,
+                diagnostic_ids,
+            )?;
             visiting.pop();
         }
     }
@@ -550,15 +905,16 @@ fn parse_check(
 
 /// Builds an `<assert>`/`<report>` element's message content in document
 /// order: text nodes anywhere in the subtree become [`MessagePart::Text`]
-/// (recursing through wrapper elements like `<emph>`/`<name>`/`<span>`,
-/// which — like Stage 1 — carry no meaning of their own here, only their
-/// text does), and `<value-of select="...">` children become
-/// [`MessagePart::ValueOf`] (`select` is required and run through
-/// [`substitute`] — its content is not descended into, the grammar
-/// defines it as empty anyway). No trimming here: that now happens on the
-/// *rendered* message at evaluation time (`plan/06-value-of-
-/// interpolation.md`), since `value-of` only has a value once evaluated
-/// against a firing check's context node.
+/// (recursing through purely presentational wrapper elements like
+/// `<emph>`/`<span>`, which — like Stage 1 — carry no meaning of their own
+/// here, only their text does), `<value-of select="...">` children become
+/// [`MessagePart::ValueOf`], and `<name path="...">` (or self-closing
+/// `<name/>`) children become [`MessagePart::Name`] (issue #4) — both
+/// `select`/`path` are run through [`substitute`], and neither element's
+/// content is descended into (the grammar defines both as empty). No
+/// trimming here: that now happens on the *rendered* message at evaluation
+/// time (`plan/06-value-of-interpolation.md`), since `value-of`/`name` only
+/// have a value once evaluated against a firing check's context node.
 fn collect_message_parts(
     node: Node<'_, '_>,
     parts: &mut Vec<MessagePart>,
@@ -572,6 +928,9 @@ fn collect_message_parts(
         } else if child.has_tag_name((SCHEMATRON_NAMESPACE, "value-of")) {
             let select = required_attribute(child, "value-of", "select")?;
             parts.push(MessagePart::ValueOf(substitute(select, params)));
+        } else if child.has_tag_name((SCHEMATRON_NAMESPACE, "name")) {
+            let path = child.attribute("path").map(|path| substitute(path, params));
+            parts.push(MessagePart::Name(path));
         } else if child.is_element() {
             collect_message_parts(child, parts, params)?;
         }
@@ -908,6 +1267,35 @@ mod tests {
         );
     }
 
+    /// Issue #4: a self-closing `<name/>` becomes `MessagePart::Name(None)`,
+    /// `<name path="...">` becomes `MessagePart::Name(Some(path))` — neither
+    /// is treated as a plain-text wrapper anymore.
+    #[test]
+    fn name_element_is_captured_as_a_message_part() {
+        let schema = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">Element <name/> or <name path="../other"/>.</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap();
+
+        let check = &schema.patterns[0].rules[0].checks[0];
+        assert_eq!(
+            check.message,
+            vec![
+                MessagePart::Text("Element ".to_owned()),
+                MessagePart::Name(None),
+                MessagePart::Text(" or ".to_owned()),
+                MessagePart::Name(Some("../other".to_owned())),
+                MessagePart::Text(".".to_owned()),
+            ]
+        );
+    }
+
     #[test]
     fn value_of_missing_select_is_an_error() {
         let error = parse(
@@ -1126,6 +1514,184 @@ mod tests {
         );
     }
 
+    /// Issue #5: `<properties>` parses successfully and its `<property>`
+    /// children are queryable from `Schema.properties`.
+    #[test]
+    fn properties_are_captured() {
+        let schema = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <properties>
+                    <property id="p1" role="severity" scheme="acme">before <value-of select="."/> after</property>
+                    <property id="p2">second</property>
+                </properties>
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap();
+
+        assert_eq!(schema.properties.len(), 2);
+        assert_eq!(schema.properties[0].id, "p1");
+        assert_eq!(schema.properties[0].role.as_deref(), Some("severity"));
+        assert_eq!(schema.properties[0].scheme.as_deref(), Some("acme"));
+        assert_eq!(
+            schema.properties[0].message,
+            vec![
+                MessagePart::Text("before ".to_owned()),
+                MessagePart::ValueOf(".".to_owned()),
+                MessagePart::Text(" after".to_owned()),
+            ]
+        );
+        assert_eq!(schema.properties[1].id, "p2");
+        assert_eq!(schema.properties[1].role, None);
+        assert_eq!(schema.properties[1].scheme, None);
+    }
+
+    #[test]
+    fn schema_without_properties_has_an_empty_properties_list() {
+        let schema = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap();
+
+        assert_eq!(schema.properties, vec![]);
+    }
+
+    #[test]
+    fn duplicate_property_id_is_an_error() {
+        let error = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <properties>
+                    <property id="p1">first</property>
+                    <property id="p1">second</property>
+                </properties>
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::DuplicateId { element: "property", id, .. } if id == "p1"
+        ));
+    }
+
+    #[test]
+    fn property_missing_id_is_an_error() {
+        let error = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <properties>
+                    <property>text</property>
+                </properties>
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ParseError::MissingAttribute {
+                element: "property",
+                attribute: "id",
+                position: Position { row: 3, col: 21 },
+            }
+        );
+    }
+
+    #[test]
+    fn unexpected_element_inside_properties_is_an_error() {
+        let error = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <properties>
+                    <bogus/>
+                </properties>
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::UnexpectedElement { element, .. } if element == "bogus"
+        ));
+    }
+
+    /// Issue #6: `schema/@queryBinding` is captured, and accepted
+    /// case-insensitively when it names an XPath-1.0-equivalent binding.
+    #[test]
+    fn query_binding_xslt_and_xpath_are_accepted_case_insensitively() {
+        for binding in ["xslt", "XSLT", "xpath", "XPath"] {
+            let schema = parse(&format!(
+                r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron" queryBinding="{binding}">
+                    <pattern>
+                        <rule context="/root">
+                            <assert test="foo">message</assert>
+                        </rule>
+                    </pattern>
+                </schema>"#,
+            ))
+            .unwrap();
+
+            assert_eq!(schema.query_binding.as_deref(), Some(binding));
+        }
+    }
+
+    #[test]
+    fn schema_without_query_binding_has_none() {
+        let schema = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap();
+
+        assert_eq!(schema.query_binding, None);
+    }
+
+    #[test]
+    fn unsupported_query_binding_is_an_error() {
+        let error = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron" queryBinding="xslt2">
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::UnsupportedQueryBinding { binding, .. } if binding == "xslt2"
+        ));
+    }
+
     #[test]
     fn let_bindings_are_captured_at_schema_pattern_and_rule_level() {
         let schema = parse(
@@ -1146,21 +1712,21 @@ mod tests {
             schema.lets,
             vec![LetBinding {
                 name: "a".to_owned(),
-                value: "1".to_owned(),
+                value: LetValue::Expr("1".to_owned()),
             }]
         );
         assert_eq!(
             schema.patterns[0].lets,
             vec![LetBinding {
                 name: "b".to_owned(),
-                value: "2".to_owned(),
+                value: LetValue::Expr("2".to_owned()),
             }]
         );
         assert_eq!(
             schema.patterns[0].rules[0].lets,
             vec![LetBinding {
                 name: "c".to_owned(),
-                value: "3".to_owned(),
+                value: LetValue::Expr("3".to_owned()),
             }]
         );
     }
@@ -1187,6 +1753,62 @@ mod tests {
                 position: Position { row: 2, col: 17 },
             }
         );
+    }
+
+    /// Issue #3: `<let>` with literal-XML (`foreign-element+`) content
+    /// instead of a `value` attribute parses as `LetValue::Literal`, its
+    /// string-value being the concatenation of every descendant text node
+    /// (nested elements are walked, only their text contributes).
+    #[test]
+    fn let_with_literal_xml_content_is_captured_as_its_string_value() {
+        let schema = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <let name="x"><foo>hello <bar>world</bar></foo></let>
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            schema.lets,
+            vec![LetBinding {
+                name: "x".to_owned(),
+                value: LetValue::Literal("hello world".to_owned()),
+            }]
+        );
+    }
+
+    /// A `<let>` with only whitespace text and no element child is still
+    /// `MissingAttribute` (the grammar's `foreign-element+` alternative
+    /// requires at least one actual element) — not silently accepted as an
+    /// empty-string literal, which would mask a forgotten `value`
+    /// attribute.
+    #[test]
+    fn let_with_only_whitespace_text_is_still_a_missing_value_error() {
+        let error = parse(
+            "<schema xmlns=\"http://purl.oclc.org/dsdl/schematron\">\
+                <let name=\"a\">   </let>\
+                <pattern>\
+                    <rule context=\"/root\">\
+                        <assert test=\"foo\">message</assert>\
+                    </rule>\
+                </pattern>\
+            </schema>",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::MissingAttribute {
+                element: "let",
+                attribute: "value",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1222,7 +1844,7 @@ mod tests {
             schema.phases[0].lets,
             vec![LetBinding {
                 name: "x".to_owned(),
-                value: "1".to_owned(),
+                value: LetValue::Expr("1".to_owned()),
             }]
         );
         assert_eq!(
@@ -1382,6 +2004,64 @@ mod tests {
         ));
     }
 
+    /// Issue #8: real XML `ID` semantics are a single, document-wide
+    /// namespace, not one per element type — a `rule/@id` colliding with a
+    /// `phase/@id` is just as much a duplicate as two `pattern/@id`s would
+    /// be, even though nothing in this crate's model ever cross-references
+    /// the two by IDREF(S) against each other.
+    #[test]
+    fn cross_element_type_id_collision_is_an_error() {
+        let error = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <phase id="shared">
+                    <active pattern="a"/>
+                </phase>
+                <pattern id="a">
+                    <rule id="shared" context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::DuplicateId { element: "rule", id, .. } if id == "shared"
+        ));
+    }
+
+    /// The counter-case the old, narrower pattern-only check never caught:
+    /// two *abstract* `pattern/@id`s were previously never checked for
+    /// uniqueness at all (silently overwriting each other in an internal
+    /// lookup table) — now a `DuplicateId` like any other.
+    #[test]
+    fn duplicate_abstract_pattern_id_is_an_error() {
+        let error = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern abstract="true" id="tpl">
+                    <rule context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+                <pattern abstract="true" id="tpl">
+                    <rule context="/root">
+                        <assert test="foo">message</assert>
+                    </rule>
+                </pattern>
+                <pattern is-a="tpl" id="concrete">
+                    <param name="x" value="1"/>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::DuplicateId { element: "pattern", id, .. } if id == "tpl"
+        ));
+    }
+
     #[test]
     fn unexpected_element_at_schema_level_is_an_error() {
         let error = parse(
@@ -1499,6 +2179,111 @@ mod tests {
             vec![
                 vec![MessagePart::Text("A".to_owned())],
                 vec![MessagePart::Text("B".to_owned())],
+            ]
+        );
+    }
+
+    /// Issue #7: a `<let>` declared in an abstract rule pulled in via
+    /// `<extends>` is now carried into the extending (concrete) rule's own
+    /// `lets`, exactly like its checks already were.
+    #[test]
+    fn extends_inlines_lets_from_another_rule_in_the_same_pattern() {
+        let schema = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule abstract="true" id="base">
+                        <let name="x" value="'from-base'"/>
+                    </rule>
+                    <rule context="/root">
+                        <extends rule="base"/>
+                        <let name="y" value="'own'"/>
+                        <assert test="false()">CHECK</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap();
+
+        let lets = &schema.patterns[0].rules[0].lets;
+        assert_eq!(
+            lets,
+            &vec![
+                LetBinding {
+                    name: "x".to_owned(),
+                    value: LetValue::Expr("'from-base'".to_owned()),
+                },
+                LetBinding {
+                    name: "y".to_owned(),
+                    value: LetValue::Expr("'own'".to_owned()),
+                },
+            ]
+        );
+    }
+
+    /// The transitive counterpart of the above, matching `extends_is_transitive`
+    /// for checks: `<let>`s from a chain of `<extends>` (rule -> b -> a) are
+    /// all carried in, in the order each rule's `<extends>` is encountered.
+    #[test]
+    fn extends_inlines_lets_transitively() {
+        let schema = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule abstract="true" id="a">
+                        <let name="x" value="'A'"/>
+                    </rule>
+                    <rule abstract="true" id="b">
+                        <extends rule="a"/>
+                        <let name="y" value="'B'"/>
+                    </rule>
+                    <rule context="/root">
+                        <extends rule="b"/>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap();
+
+        let lets = &schema.patterns[0].rules[0].lets;
+        assert_eq!(
+            lets.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
+    }
+
+    /// A `<let>` inherited via `<extends>` that appears *before* the
+    /// extending rule's own same-named `<let>` in document order is
+    /// shadowed by it (own wins) — matching `extend_lets`'s "later in the
+    /// vector wins" evaluation order in `engine.rs`.
+    #[test]
+    fn own_let_shadows_an_earlier_inherited_let_of_the_same_name() {
+        let schema = parse(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule abstract="true" id="base">
+                        <let name="x" value="'from-base'"/>
+                    </rule>
+                    <rule context="/root">
+                        <extends rule="base"/>
+                        <let name="x" value="'own'"/>
+                        <assert test="false()">CHECK</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )
+        .unwrap();
+
+        let lets = &schema.patterns[0].rules[0].lets;
+        assert_eq!(
+            lets,
+            &vec![
+                LetBinding {
+                    name: "x".to_owned(),
+                    value: LetValue::Expr("'from-base'".to_owned()),
+                },
+                LetBinding {
+                    name: "x".to_owned(),
+                    value: LetValue::Expr("'own'".to_owned()),
+                },
             ]
         );
     }
@@ -1641,7 +2426,7 @@ mod tests {
 
         let rule = &schema.patterns[0].rules[0];
         assert_eq!(rule.context, "item");
-        assert_eq!(rule.lets[0].value, "$el");
+        assert_eq!(rule.lets[0].value, LetValue::Expr("$el".to_owned()));
     }
 
     #[test]
@@ -1659,5 +2444,243 @@ mod tests {
             error,
             ParseError::UnknownAbstractPattern { pattern, .. } if pattern == "missing"
         ));
+    }
+
+    // ---- issue #2: <include href="..."> resolution -----------------
+
+    use crate::resolver::{ResolveError, SchemaSource};
+    use std::collections::BTreeMap;
+
+    /// A trivial in-memory resolver, test-only — mirrors the sister crate
+    /// `relax-ng`'s own `examples/validate.rs::InMemoryResolver` pattern.
+    struct MapResolver(BTreeMap<&'static str, &'static str>);
+
+    impl SchemaResolver for MapResolver {
+        fn resolve(&self, href: &str, _base_uri: &str) -> Result<SchemaSource, ResolveError> {
+            self.0
+                .get(href)
+                .map(|text| SchemaSource::new(*text, href))
+                .ok_or_else(|| ResolveError::new(format!("no such resource: {href}")))
+        }
+    }
+
+    #[test]
+    fn include_at_schema_level_splices_a_pattern_fragment() {
+        let resolver = MapResolver(BTreeMap::from([(
+            "pattern.sch",
+            r#"<pattern xmlns="http://purl.oclc.org/dsdl/schematron" id="included">
+                <rule context="/root">
+                    <assert test="foo">from included pattern</assert>
+                </rule>
+            </pattern>"#,
+        )]));
+
+        let schema = parse_with_resolver(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <include href="pattern.sch"/>
+            </schema>"#,
+            "root.sch",
+            &resolver,
+        )
+        .unwrap();
+
+        assert_eq!(schema.patterns.len(), 1);
+        assert_eq!(schema.patterns[0].id.as_deref(), Some("included"));
+        assert_eq!(schema.patterns[0].rules[0].context, "/root");
+    }
+
+    /// The same mechanism works below the schema level too — an `<assert>`
+    /// fragment included at rule level — proving `resolve_includes` is a
+    /// position-agnostic text splice, not something special-cased to the
+    /// schema/pattern level only.
+    #[test]
+    fn include_at_rule_level_splices_an_assert_fragment() {
+        let resolver = MapResolver(BTreeMap::from([(
+            "assert.sch",
+            r#"<assert xmlns="http://purl.oclc.org/dsdl/schematron" test="foo">from included assert</assert>"#,
+        )]));
+
+        let schema = parse_with_resolver(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule context="/root">
+                        <include href="assert.sch"/>
+                    </rule>
+                </pattern>
+            </schema>"#,
+            "root.sch",
+            &resolver,
+        )
+        .unwrap();
+
+        assert_eq!(
+            schema.patterns[0].rules[0].checks[0].message,
+            vec![MessagePart::Text("from included assert".to_owned())]
+        );
+    }
+
+    /// A resolved fragment's own `<include>` is resolved too, against its
+    /// own base URI — transitive resolution, not just one level deep.
+    #[test]
+    fn include_resolves_transitively() {
+        let resolver = MapResolver(BTreeMap::from([
+            (
+                "outer.sch",
+                r#"<pattern xmlns="http://purl.oclc.org/dsdl/schematron" id="outer">
+                    <include href="b.sch"/>
+                </pattern>"#,
+            ),
+            (
+                "b.sch",
+                r#"<rule xmlns="http://purl.oclc.org/dsdl/schematron" context="/root">
+                    <assert test="foo">transitively included</assert>
+                </rule>"#,
+            ),
+        ]));
+
+        let schema = parse_with_resolver(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <include href="outer.sch"/>
+            </schema>"#,
+            "root.sch",
+            &resolver,
+        )
+        .unwrap();
+
+        assert_eq!(schema.patterns[0].id.as_deref(), Some("outer"));
+        assert_eq!(
+            schema.patterns[0].rules[0].checks[0].message,
+            vec![MessagePart::Text("transitively included".to_owned())]
+        );
+    }
+
+    #[test]
+    fn cyclic_include_is_an_error() {
+        // `a.sch` includes itself — the most direct cycle. (The cycle
+        // guard's key is `"{base_uri}::{href}"`, same convention as the
+        // sister crate `relax-ng`'s own include/externalRef guard — for an
+        // indirect cycle through a *different* intermediate base URI at
+        // each hop, that scheme still catches it, just not necessarily on
+        // the very first repeat; a direct self-include like this one is
+        // always caught immediately, which is what this test pins down.)
+        let resolver = MapResolver(BTreeMap::from([(
+            "a.sch",
+            r#"<pattern xmlns="http://purl.oclc.org/dsdl/schematron" id="a">
+                <include href="a.sch"/>
+            </pattern>"#,
+        )]));
+
+        let error = parse_with_resolver(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <include href="a.sch"/>
+            </schema>"#,
+            "root.sch",
+            &resolver,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ParseError::CyclicInclude { href, .. } if href == "a.sch"));
+    }
+
+    #[test]
+    fn unresolvable_include_surfaces_the_resolver_error() {
+        let resolver = MapResolver(BTreeMap::new());
+
+        let error = parse_with_resolver(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <include href="missing.sch"/>
+            </schema>"#,
+            "root.sch",
+            &resolver,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::UnresolvableInclude { href, .. } if href == "missing.sch"
+        ));
+    }
+
+    #[test]
+    fn including_a_whole_schema_is_an_error() {
+        let resolver = MapResolver(BTreeMap::from([(
+            "whole.sch",
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">m</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+        )]));
+
+        let error = parse_with_resolver(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <include href="whole.sch"/>
+            </schema>"#,
+            "root.sch",
+            &resolver,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::InvalidInclude { href, .. } if href == "whole.sch"
+        ));
+    }
+
+    #[test]
+    fn including_a_non_schematron_root_is_an_error() {
+        let resolver = MapResolver(BTreeMap::from([(
+            "other.xml",
+            r#"<foo xmlns="http://example.com/other"/>"#,
+        )]));
+
+        let error = parse_with_resolver(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <include href="other.xml"/>
+            </schema>"#,
+            "root.sch",
+            &resolver,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::InvalidInclude { href, .. } if href == "other.xml"
+        ));
+    }
+
+    /// The counter-case to the resolver-based tests above:
+    /// `unexpected_element_at_schema_level_is_an_error` (elsewhere in this
+    /// module) already proves plain `parse()` — no resolver — still
+    /// rejects `<include>` clearly as `ParseError::UnexpectedElement`,
+    /// rather than silently doing something partial.
+    #[test]
+    fn parse_with_resolver_missing_href_is_a_missing_attribute_error() {
+        let resolver = MapResolver(BTreeMap::new());
+
+        let error = parse_with_resolver(
+            r#"<schema xmlns="http://purl.oclc.org/dsdl/schematron">
+                <include/>
+                <pattern>
+                    <rule context="/root">
+                        <assert test="foo">m</assert>
+                    </rule>
+                </pattern>
+            </schema>"#,
+            "root.sch",
+            &resolver,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ParseError::MissingAttribute {
+                element: "include",
+                attribute: "href",
+                position: Position { row: 2, col: 17 },
+            }
+        );
     }
 }

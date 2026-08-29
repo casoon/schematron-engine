@@ -1,0 +1,21 @@
+<testcase xmlns="tag:dmaus@dmaus.name,2019:Schematron:Testsuite" id="rule-order" expectValid="true">
+  <label>Lexical order of rules is significant</label>
+  <reference>ISO Schematron 2016: Section 6.5 clause 5</reference>
+  <documents>
+    <document id="primary" filename="document.xml">
+      <element xmlns=""/>
+    </document>
+  </documents>
+  <schemas document="primary">
+    <sch:schema xmlns:sch="http://purl.oclc.org/dsdl/schematron">
+      <sch:pattern>
+        <sch:rule context="element">
+          <sch:assert test="true()"/>
+        </sch:rule>
+        <sch:rule context="*">
+          <sch:assert test="false()"/>
+        </sch:rule>
+      </sch:pattern>
+    </sch:schema>
+  </schemas>
+</testcase>

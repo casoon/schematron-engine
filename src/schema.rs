@@ -14,6 +14,19 @@ pub struct Schema {
     pub phases: Vec<Phase>,
     pub patterns: Vec<Pattern>,
     pub diagnostics: Vec<Diagnostic>,
+    /// `<properties><property id="..." .../>...</properties>` (ISO
+    /// Schematron 2016 extension, issue #5) — generic, queryable metadata
+    /// this crate has no opinion on beyond parsing and exposing it; nothing
+    /// here affects assertion outcomes.
+    pub properties: Vec<Property>,
+    /// `schema/@queryBinding`, raw as declared (issue #6) — `None` if
+    /// absent (this crate's default: XPath 1.0, same as every declared
+    /// binding this crate accepts; see [`crate::parser::parse`], which
+    /// rejects any binding not equivalent to XPath 1.0 with
+    /// `ParseError::UnsupportedQueryBinding` rather than silently
+    /// evaluating `test`/`context`/`select` expressions as XPath 1.0 when
+    /// the schema declared something else, e.g. `"xslt2"`).
+    pub query_binding: Option<String>,
 }
 
 /// A `<diagnostic id="..." role="...">` — referenced by a [`Check`]'s
@@ -23,6 +36,24 @@ pub struct Schema {
 pub struct Diagnostic {
     pub id: String,
     pub role: Option<String>,
+    pub message: Vec<MessagePart>,
+}
+
+/// A `<property id="..." role="..." scheme="...">` — a `<properties>`
+/// child, generic key/value-ish metadata (ISO Schematron 2016 extension,
+/// issue #5). `message` uses the same rich-content model as a check's own
+/// message. Note: unlike [`Diagnostic`], this crate does not (yet) model
+/// `assert|report/@properties` (the parallel IDREFS attribute the ISO
+/// grammar allows on checks, mirroring `@diagnostics`) — out of scope for
+/// issue #5, which only covers the top-level `<properties>` construct
+/// itself; that attribute is silently unread, same as several other
+/// `assert`/`report` attributes (`flag`, `subject`, ...) this crate
+/// doesn't model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Property {
+    pub id: String,
+    pub role: Option<String>,
+    pub scheme: Option<String>,
     pub message: Vec<MessagePart>,
 }
 
@@ -39,17 +70,38 @@ pub struct Phase {
     pub active: Vec<String>,
 }
 
-/// A `<let name="..." value="...">` variable binding. `value` is the raw,
-/// unparsed XPath expression (see [`Rule::context`]/[`Check::test`] for the
-/// same treatment). See `plan/04-let-bindings.md` for scope (only the
-/// `value`-attribute form is supported, not the `foreign-element+` literal-
-/// XML-content form) and evaluation semantics (schema/pattern-level `<let>`
-/// evaluate against the document root, rule-level against the matched
-/// context node, per [`crate::engine::evaluate`]).
+/// A `<let name="...">` variable binding — either `<let name="..."
+/// value="...">` ([`LetValue::Expr`]) or `<let name="...">`, with literal
+/// XML content instead of a `value` attribute ([`LetValue::Literal`],
+/// issue #3). See `plan/04-let-bindings.md` for evaluation semantics
+/// (schema/pattern-level `<let>` evaluate against the document root,
+/// rule-level against the matched context node, per
+/// [`crate::engine::evaluate`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LetBinding {
     pub name: String,
-    pub value: String,
+    pub value: LetValue,
+}
+
+/// A [`LetBinding`]'s value — see its doc comment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LetValue {
+    /// `<let value="...">` — the raw, unparsed XPath expression (see
+    /// [`Rule::context`]/[`Check::test`] for the same raw-string
+    /// treatment).
+    Expr(String),
+    /// `<let>` with literal-XML (`foreign-element+`) content instead of a
+    /// `value` attribute (issue #3) — pre-computed to its string-value
+    /// (concatenation of every descendant text node, document order) at
+    /// parse time, since `xpath-eval`'s `Value<N>` has no representation
+    /// for a detached literal node-set of a caller-supplied, generic node
+    /// type `N`. Bound as `Value::String` at evaluation time — the same
+    /// treatment XSLT 1.0 gives a variable bound to a literal
+    /// result-tree-fragment by default (usable as a string, not as a
+    /// navigable node-set; this crate has no `exsl:node-set()`-equivalent
+    /// escape hatch, consistent with implementing XPath 1.0 only, no XSLT
+    /// extension functions).
+    Literal(String),
 }
 
 /// An `<ns prefix="..." uri="..."/>` binding, used to resolve prefixes in
@@ -98,18 +150,25 @@ pub struct Check {
 ///
 /// The ISO Schematron content model for `assert`/`report` also allows
 /// `name`/`emph`/`dir`/`span` markup (and arbitrary foreign-namespace
-/// elements) — only `<value-of select="...">` is evaluated (Stage 2, see
-/// `plan/06-value-of-interpolation.md`); text nested inside the other,
-/// unsupported wrapper elements still contributes via `Text` (the wrapper
-/// tag itself carries no meaning here, same as Stage 1's plain-text
-/// handling), but those elements' own semantics (e.g. `<name/>` resolving
-/// to the context node's name) are not implemented.
+/// elements). `<value-of select="...">` (Stage 2, see
+/// `plan/06-value-of-interpolation.md`) and `<name path="...">` (issue #4)
+/// are both evaluated — `emph`/`dir`/`span` are purely presentational
+/// (HTML-ish emphasis/direction/span wrappers) with no data-dependent
+/// semantics, so text nested inside those still contributes via `Text`
+/// (the wrapper tag itself carries no meaning here, same as Stage 1's
+/// plain-text handling), but their own tags are not otherwise modeled.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MessagePart {
     Text(String),
     /// A `<value-of select="...">` — `select` is the raw, unparsed XPath
     /// expression, evaluated against the firing check's context node.
     ValueOf(String),
+    /// A `<name path="...">` (or self-closing `<name/>`) — resolves to the
+    /// expanded name (`name()` semantics) of the node `path` selects, or of
+    /// the firing check's own context node when `path` is absent (`None`).
+    /// `path` is the raw, unparsed XPath expression, like `ValueOf`'s
+    /// `select`.
+    Name(Option<String>),
 }
 
 /// Whether a [`Check`] is an `<assert>` (fails when `test` evaluates to
