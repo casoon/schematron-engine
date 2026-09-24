@@ -1,5 +1,17 @@
 # schematron-engine
 
+> **Dieses Repository ist stillgelegt (24.09.2026).** Das Crate lebt weiter, aber
+> die Quelle ist jetzt das Monorepo
+> **[casoon/barrierlab](https://github.com/casoon/barrierlab)** — dort liegt es
+> unter `crates/schematron-engine/`, mit der vollständigen Historie dieses Repositorys, neben
+> `html-conform`, das es benutzt.
+>
+> - **crates.io bleibt unverändert.** Was danach erscheint, kommt aus barrierlab.
+> - **Änderungen und Fehler** gehören dorthin. Hier wird nichts mehr gebaut.
+> - Doku: <https://casoon.github.io/barrierlab/>
+>
+> Der Text unten beschreibt den Stand bei der Stilllegung.
+
 A pure-Rust implementation of [ISO Schematron](https://www.iso.org/standard/74240.html)
 — parses a Schematron `.sch` schema (`pattern`/`rule`/`assert`/`report`
 structure) and evaluates it against a document, producing structured
